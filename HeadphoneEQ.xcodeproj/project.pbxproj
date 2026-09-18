@@ -1,0 +1,25 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+		A1 = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = YES; LastSwiftUpdateCheck = 1600; LastUpgradeCheck = 1600;}; buildConfigurationList = A2; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A3; productRefGroup = A4; projectDirPath = ""; projectRoot = ""; targets = (A5);};
+		A2 = {isa = XCConfigurationList; buildConfigurations = (A6, A7); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		A3 = {isa = PBXGroup; children = (B1, A4); sourceTree = "<group>";};
+		A4 = {isa = PBXGroup; children = (A8); name = Products; sourceTree = "<group>";};
+		A5 = {isa = PBXNativeTarget; buildConfigurationList = A9; buildPhases = (B2, B3, B4); buildRules = (); dependencies = (); fileSystemSynchronizedGroups = (B1); name = HeadphoneEQ; productName = HeadphoneEQ; productReference = A8; productType = "com.apple.product-type.application";};
+		A6 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0;}; name = Debug;};
+		A7 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0;}; name = Release;};
+		A9 = {isa = XCConfigurationList; buildConfigurations = (C1, C2); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		A8 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HeadphoneEQ.app; sourceTree = BUILT_PRODUCTS_DIR;};
+		B1 = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (B5); path = HeadphoneEQ; sourceTree = "<group>";};
+		B2 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;};
+		B3 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;};
+		B4 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;};
+		B5 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (Info.plist, HeadphoneEQ.entitlements); target = A5;};
+		C1 = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = HeadphoneEQ/HeadphoneEQ.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = HeadphoneEQ/Info.plist; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.2; PRODUCT_BUNDLE_IDENTIFIER = com.local.BridgeEQ; PRODUCT_NAME = BridgeEQ; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 5.0;}; name = Debug;};
+		C2 = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = HeadphoneEQ/HeadphoneEQ.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = HeadphoneEQ/Info.plist; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.2; PRODUCT_BUNDLE_IDENTIFIER = com.local.BridgeEQ; PRODUCT_NAME = BridgeEQ; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0;}; name = Release;};
+	};
+	rootObject = A1;
+}
