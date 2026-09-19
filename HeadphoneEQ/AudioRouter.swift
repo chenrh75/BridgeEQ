@@ -2,12 +2,38 @@ import Foundation
 import AVFoundation
 import CoreAudio
 import AudioToolbox
+import Accelerate
+import os
+
+private struct StereoMeterLevels {
+    var leftPeak: Float = 0
+    var rightPeak: Float = 0
+    var leftRMS: Float = 0
+    var rightRMS: Float = 0
+}
+
+private func measureLevels(_ buffer: AVAudioPCMBuffer) -> StereoMeterLevels {
+    guard let data = buffer.floatChannelData else { return StereoMeterLevels() }
+    let count = vDSP_Length(buffer.frameLength)
+    guard count > 0 else { return StereoMeterLevels() }
+    var levels = StereoMeterLevels()
+    vDSP_maxmgv(data[0], 1, &levels.leftPeak, count)
+    vDSP_rmsqv(data[0], 1, &levels.leftRMS, count)
+    if buffer.format.channelCount > 1 {
+        vDSP_maxmgv(data[1], 1, &levels.rightPeak, count)
+        vDSP_rmsqv(data[1], 1, &levels.rightRMS, count)
+    } else {
+        levels.rightPeak = levels.leftPeak
+        levels.rightRMS = levels.leftRMS
+    }
+    return levels
+}
 
 @MainActor
 final class AudioRouter: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var status = "Stopped"
-    @Published private(set) var meter = MeterState()
+    let meters = MeterModel()
 
     private var inputCapture: HALInputCapture?
     private var outputEngine: AVAudioEngine?
@@ -17,13 +43,15 @@ final class AudioRouter: ObservableObject {
     private var configObserver: NSObjectProtocol?
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     private var meterTimer: Timer?
-    private var systemOutputTimer: Timer?
     private var routeInputDeviceID: AudioDeviceID?
     private var lastDefaultOutputDeviceID: AudioDeviceID?
-    private var latestInputLeft: Float = 0, latestInputRight: Float = 0
-    private var latestOutputLeft: Float = 0, latestOutputRight: Float = 0
+    private let inputLevels = MeterAccumulator()
+    private let outputLevels = MeterAccumulator()
     private var holdUntil = [TimeInterval](repeating: 0, count: 4)
     private var clipUntil = [TimeInterval](repeating: 0, count: 4)
+    // The Float processing path has headroom above full scale. Only values that
+    // actually exceed 0 dBFS are overs; near-full-scale legal samples are not.
+    private static let clipThreshold: Float = 1.0
     private var ignoreConfigurationChangesUntil = Date.distantPast
     var onRecoveryNeeded: (() -> Void)?
 
@@ -79,13 +107,6 @@ final class AudioRouter: ObservableObject {
         requestRecovery(reason: "BlackHole became system output; reconnecting…")
     }
 
-    private func startSystemOutputMonitor() {
-        systemOutputTimer?.invalidate()
-        systemOutputTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkSystemOutputChange() }
-        }
-    }
-
     func start(input: AudioDevice, output: AudioDevice, preset: EQPreset) throws {
         stop()
         ignoreConfigurationChangesUntil = Date().addingTimeInterval(3)
@@ -110,12 +131,7 @@ final class AudioRouter: ObservableObject {
         try outputEngine.start()
         player.play()
 
-        let capture = try HALInputCapture(deviceID: input.id, format: processingFormat, player: player) { [weak self] left, right in
-            Task { @MainActor in
-                self?.latestInputLeft = max(self?.latestInputLeft ?? 0, left)
-                self?.latestInputRight = max(self?.latestInputRight ?? 0, right)
-            }
-        }
+        let capture = try HALInputCapture(deviceID: input.id, format: processingFormat, player: player, levels: inputLevels)
         try capture.start()
         self.inputCapture = capture; self.outputEngine = outputEngine; self.player = player
         self.eq = eq; self.gainMixer = mixer
@@ -123,24 +139,32 @@ final class AudioRouter: ObservableObject {
         lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
         running = true; status = "Routing \(input.name) → \(output.name)"
         startMeterTimer()
-        startSystemOutputMonitor()
     }
 
     func stop() {
         meterTimer?.invalidate(); meterTimer = nil
-        systemOutputTimer?.invalidate(); systemOutputTimer = nil
         gainMixer?.removeTap(onBus: 0)
         inputCapture?.stop(); player?.stop(); outputEngine?.stop()
         inputCapture = nil; outputEngine = nil; player = nil; eq = nil; gainMixer = nil
         routeInputDeviceID = nil; lastDefaultOutputDeviceID = nil
-        running = false; status = "Stopped"; meter = MeterState()
+        _ = inputLevels.drain(); _ = outputLevels.drain()
+        holdUntil = [TimeInterval](repeating: 0, count: 4)
+        clipUntil = [TimeInterval](repeating: 0, count: 4)
+        running = false; status = "Stopped"; meters.state = MeterState()
     }
 
     func update(_ preset: EQPreset) { if let eq, let gainMixer { apply(preset, eq: eq, mixer: gainMixer) } }
 
     private func apply(_ preset: EQPreset, eq: AVAudioUnitEQ, mixer: AVAudioMixerNode) {
         eq.globalGain = Float(preset.preamp)
-        eq.bypass = preset.globalBypass
+        let hasAudibleBand = preset.bands.contains { band in
+            guard band.enabled else { return false }
+            switch band.type {
+            case .lowPass, .highPass: return true
+            case .parametric, .lowShelf, .highShelf: return abs(band.gain) > 0.0001
+            }
+        }
+        eq.bypass = preset.globalBypass || (!hasAudibleBand && abs(preset.preamp) <= 0.0001)
         for (index, target) in eq.bands.enumerated() {
             guard index < preset.bands.count else { target.bypass = true; continue }
             let source = preset.bands[index]
@@ -150,66 +174,96 @@ final class AudioRouter: ObservableObject {
             // AVAudioUnitEQ expresses bandwidth in octaves; the UI and APO format use Q.
             let q = source.q.clamped(to: 0.1...20)
             target.bandwidth = Float(2 * asinh(1 / (2 * q)) / log(2))
-            target.bypass = !source.enabled
+            let isNeutralGainFilter = source.type != .lowPass && source.type != .highPass && abs(source.gain) <= 0.0001
+            target.bypass = !source.enabled || isNeutralGainFilter
         }
         mixer.outputVolume = pow(10, Float(preset.outputGain) / 20)
     }
 
     private func installMeter(on node: AVAudioNode, bus: AVAudioNodeBus, input: Bool) {
-        node.installTap(onBus: bus, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
-            let peaks = Self.channelPeaks(buffer)
-            Task { @MainActor in
-                guard let self else { return }
-                if input {
-                    self.latestInputLeft = max(self.latestInputLeft, peaks.0)
-                    self.latestInputRight = max(self.latestInputRight, peaks.1)
-                } else {
-                    self.latestOutputLeft = max(self.latestOutputLeft, peaks.0)
-                    self.latestOutputRight = max(self.latestOutputRight, peaks.1)
-                }
-            }
+        let accumulator = input ? inputLevels : outputLevels
+        node.installTap(onBus: bus, bufferSize: 2048, format: nil) { buffer, _ in
+            accumulator.accumulate(measureLevels(buffer))
         }
-    }
-
-    private static func channelPeaks(_ buffer: AVAudioPCMBuffer) -> (Float, Float) {
-        guard let data = buffer.floatChannelData else { return (0, 0) }
-        var left: Float = 0, right: Float = 0
-        for i in 0..<Int(buffer.frameLength) { left = max(left, abs(data[0][i])) }
-        if buffer.format.channelCount > 1 {
-            for i in 0..<Int(buffer.frameLength) { right = max(right, abs(data[1][i])) }
-        } else { right = left }
-        return (left, right)
     }
 
     private func startMeterTimer() {
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                let samples = [self.latestInputLeft, self.latestInputRight, self.latestOutputLeft, self.latestOutputRight]
-                self.latestInputLeft = 0; self.latestInputRight = 0; self.latestOutputLeft = 0; self.latestOutputRight = 0
-                let old = [self.meter.inputLeft, self.meter.inputRight, self.meter.outputLeft, self.meter.outputRight]
-                let oldHolds = [self.meter.inputLeftHold, self.meter.inputRightHold, self.meter.outputLeftHold, self.meter.outputRightHold]
-                let now = ProcessInfo.processInfo.systemUptime
-                var shown = [Float](repeating: 0, count: 4), holds = oldHolds, clips = [Bool](repeating: false, count: 4)
-                for index in 0..<4 {
-                    shown[index] = Self.meterBallistic(previous: old[index], sample: samples[index])
-                    if samples[index] >= holds[index] || now >= self.holdUntil[index] {
-                        holds[index] = max(samples[index], shown[index]); self.holdUntil[index] = now + 1.0
-                    }
-                    if samples[index] >= 0.999 { self.clipUntil[index] = now + 1.0 }
-                    clips[index] = now < self.clipUntil[index]
-                }
-                self.meter = MeterState(inputLeft: shown[0], inputRight: shown[1], outputLeft: shown[2], outputRight: shown[3],
-                                        inputLeftHold: holds[0], inputRightHold: holds[1], outputLeftHold: holds[2], outputRightHold: holds[3],
-                                        inputLeftClips: clips[0], inputRightClips: clips[1], outputLeftClips: clips[2], outputRightClips: clips[3])
-            }
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateMeters() }
         }
+        timer.tolerance = 1.0 / 120.0
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    private func updateMeters() {
+        let input = inputLevels.drain()
+        let output = outputLevels.drain()
+        let previous = meters.state
+        var meter = previous
+        let now = ProcessInfo.processInfo.systemUptime
+
+        updateMeterChannel(level: input.leftRMS, peak: input.leftPeak, reportsClip: false,
+                           shown: &meter.inputLeft, hold: &meter.inputLeftHold,
+                           holdUntil: &holdUntil[0], clipped: &meter.inputLeftClips, clipUntil: &clipUntil[0], now: now)
+        updateMeterChannel(level: input.rightRMS, peak: input.rightPeak, reportsClip: false,
+                           shown: &meter.inputRight, hold: &meter.inputRightHold,
+                           holdUntil: &holdUntil[1], clipped: &meter.inputRightClips, clipUntil: &clipUntil[1], now: now)
+        updateMeterChannel(level: output.leftRMS, peak: output.leftPeak, reportsClip: true,
+                           shown: &meter.outputLeft, hold: &meter.outputLeftHold,
+                           holdUntil: &holdUntil[2], clipped: &meter.outputLeftClips, clipUntil: &clipUntil[2], now: now)
+        updateMeterChannel(level: output.rightRMS, peak: output.rightPeak, reportsClip: true,
+                           shown: &meter.outputRight, hold: &meter.outputRightHold,
+                           holdUntil: &holdUntil[3], clipped: &meter.outputRightClips, clipUntil: &clipUntil[3], now: now)
+        if meter != previous { meters.state = meter }
+    }
+
+    private func updateMeterChannel(level: Float, peak: Float, reportsClip: Bool,
+                                    shown: inout Float, hold: inout Float,
+                                    holdUntil: inout TimeInterval, clipped: inout Bool,
+                                    clipUntil: inout TimeInterval, now: TimeInterval) {
+        shown = Self.meterBallistic(previous: shown, sample: level)
+        if peak >= hold || now >= holdUntil {
+            hold = max(peak, shown)
+            holdUntil = now + 1.0
+        }
+        if reportsClip && peak > Self.clipThreshold { clipUntil = now + 1.0 }
+        if !reportsClip { clipUntil = 0 }
+        clipped = now < clipUntil
     }
 
     private static func meterBallistic(previous: Float, sample: Float) -> Float {
         if sample >= previous { return sample }
-        let previousDB = 20 * log10(max(previous, 0.001))
-        return pow(10, max(-60, previousDB - 0.4) / 20) // 24 dB/second release at 60 Hz.
+        return max(0.001, previous * 0.91201084) // Exactly 0.8 dB per frame at 30 Hz.
+    }
+}
+
+@MainActor
+final class MeterModel {
+    var onUpdate: ((MeterState) -> Void)?
+    var state = MeterState() {
+        didSet { onUpdate?(state) }
+    }
+}
+
+private final class MeterAccumulator: @unchecked Sendable {
+    private let levels = OSAllocatedUnfairLock(initialState: StereoMeterLevels())
+
+    func accumulate(_ incoming: StereoMeterLevels) {
+        levels.withLock {
+            $0.leftPeak = max($0.leftPeak, incoming.leftPeak)
+            $0.rightPeak = max($0.rightPeak, incoming.rightPeak)
+            $0.leftRMS = max($0.leftRMS, incoming.leftRMS)
+            $0.rightRMS = max($0.rightRMS, incoming.rightRMS)
+        }
+    }
+
+    func drain() -> StereoMeterLevels {
+        levels.withLock {
+            let result = $0
+            $0 = StereoMeterLevels()
+            return result
+        }
     }
 }
 
@@ -217,13 +271,12 @@ private final class HALInputCapture: @unchecked Sendable {
     private var unit: AudioUnit?
     private let format: AVAudioFormat
     private weak var player: AVAudioPlayerNode?
-    private let onPeak: @Sendable (Float, Float) -> Void
-    private let lock = NSLock()
-    private var queued = 0
+    private let levels: MeterAccumulator
+    private let buffers = OSAllocatedUnfairLock(initialState: [AVAudioPCMBuffer]())
 
     init(deviceID: AudioDeviceID, format: AVAudioFormat, player: AVAudioPlayerNode,
-         onPeak: @escaping @Sendable (Float, Float) -> Void) throws {
-        self.format = format; self.player = player; self.onPeak = onPeak
+         levels: MeterAccumulator) throws {
+        self.format = format; self.player = player; self.levels = levels
         var description = AudioComponentDescription(componentType: kAudioUnitType_Output,
                                                     componentSubType: kAudioUnitSubType_HALOutput,
                                                     componentManufacturer: kAudioUnitManufacturer_Apple,
@@ -243,6 +296,16 @@ private final class HALInputCapture: @unchecked Sendable {
                                               inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
         try check(AudioUnitSetProperty(created, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "Install HAL input callback")
         try check(AudioUnitInitialize(created), "Initialize HAL input")
+        var maximumFrames: UInt32 = 4096
+        var maximumFramesSize = UInt32(MemoryLayout<UInt32>.size)
+        AudioUnitGetProperty(created, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
+                             &maximumFrames, &maximumFramesSize)
+        let bufferFrameCapacity = maximumFrames
+        buffers.withLock { pool in
+            pool = (0..<16).compactMap { _ in
+                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: bufferFrameCapacity)
+            }
+        }
     }
 
     func start() throws { guard let unit else { return }; try check(AudioOutputUnitStart(unit), "Start HAL input") }
@@ -250,23 +313,32 @@ private final class HALInputCapture: @unchecked Sendable {
     deinit { stop() }
 
     fileprivate func render(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, time: UnsafePointer<AudioTimeStamp>, frames: UInt32) -> OSStatus {
-        guard let unit, let player, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return noErr }
+        guard let unit, let player, let buffer = acquireBuffer(for: frames) else { return noErr }
         buffer.frameLength = frames
         let status = AudioUnitRender(unit, flags, time, 1, frames, buffer.mutableAudioBufferList)
-        guard status == noErr else { return status }
-        var left: Float = 0, right: Float = 0
-        if let data = buffer.floatChannelData {
-            for i in 0..<Int(frames) { left = max(left, abs(data[0][i])) }
-            if buffer.format.channelCount > 1 { for i in 0..<Int(frames) { right = max(right, abs(data[1][i])) } } else { right = left }
+        guard status == noErr else {
+            release(buffer)
+            return status
         }
-        onPeak(left, right)
-        lock.lock(); let accept = queued < 12; if accept { queued += 1 }; lock.unlock()
-        if accept {
-            player.scheduleBuffer(buffer) { [weak self] in
-                guard let self else { return }; self.lock.lock(); self.queued = max(0, self.queued - 1); self.lock.unlock()
-            }
-        }
+        levels.accumulate(measureLevels(buffer))
+        player.scheduleBuffer(buffer) { [weak self] in self?.release(buffer) }
         return noErr
+    }
+
+    private func acquireBuffer(for frames: UInt32) -> AVAudioPCMBuffer? {
+        buffers.withLock { pool in
+            guard let buffer = pool.popLast() else { return nil }
+            guard buffer.frameCapacity >= frames else {
+                pool.append(buffer)
+                return nil
+            }
+            return buffer
+        }
+    }
+
+    private func release(_ buffer: AVAudioPCMBuffer) {
+        buffer.frameLength = 0
+        buffers.withLock { $0.append(buffer) }
     }
 }
 

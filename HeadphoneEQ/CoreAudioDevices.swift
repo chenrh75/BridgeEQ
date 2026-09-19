@@ -118,7 +118,7 @@ func selectOutputDevice(_ id: AudioDeviceID, on node: AVAudioOutputNode) throws 
 
 func selectBlackHoleInputChannels(on node: AVAudioInputNode, physicalInputChannels: Int, virtualInputChannels: Int) throws {
     guard let audioUnit = node.audioUnit else { throw AudioDeviceError.osStatus(-1, "Access input audio unit") }
-    var map = (0..<virtualInputChannels).map { Int32(physicalInputChannels + $0) }
+    let map = (0..<virtualInputChannels).map { Int32(physicalInputChannels + $0) }
     let status = map.withUnsafeBytes { bytes in
         AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1, bytes.baseAddress, UInt32(bytes.count))
     }

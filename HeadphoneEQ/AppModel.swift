@@ -1,7 +1,6 @@
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
-import Combine
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -13,7 +12,6 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     let router = AudioRouter()
     private var retryTask: Task<Void, Never>?
-    private var routerSubscription: AnyCancellable?
     private let defaults = UserDefaults.standard
 
     var inputs: [AudioDevice] { devices.filter { $0.inputChannels > 0 } }
@@ -22,17 +20,16 @@ final class AppModel: ObservableObject {
     var selectedOutput: AudioDevice? { devices.first { $0.uid == outputUID } }
 
     init() {
-        routerSubscription = router.objectWillChange.sink { [weak self] in
-            self?.objectWillChange.send()
-        }
         loadState(); refreshDevices()
         router.onRecoveryNeeded = { [weak self] in self?.scheduleRecovery() }
         if ProcessInfo.processInfo.arguments.contains("--smoke-test-route") {
+            let routeTestSeconds = ProcessInfo.processInfo.environment["BRIDGEEQ_ROUTE_TEST_SECONDS"]
+                .flatMap(Double.init) ?? 2
             Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(500))
                 guard let self else { Foundation.exit(2) }
                 self.toggle()
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(routeTestSeconds))
                 if self.router.running {
                     print("ROUTE_SMOKE_TEST_PASSED: \(self.router.status)")
                     self.router.stop()

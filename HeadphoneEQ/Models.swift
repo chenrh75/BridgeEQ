@@ -45,7 +45,7 @@ struct AudioDevice: Identifiable, Hashable {
     var label: String { "\(name) · \(inputChannels) in / \(outputChannels) out" }
 }
 
-struct MeterState {
+struct MeterState: Equatable {
     var inputLeft: Float = 0, inputRight: Float = 0
     var outputLeft: Float = 0, outputRight: Float = 0
     var inputLeftHold: Float = 0, inputRightHold: Float = 0

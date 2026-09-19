@@ -2,11 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleDisplayName</key><string>BridgeEQ</string>
+  <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>com.local.BridgeEQ</string>
   <key>CFBundleName</key><string>BridgeEQ</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.3</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>LSMultipleInstancesProhibited</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSMicrophoneUsageDescription</key><string>BridgeEQ needs audio-input access to receive system audio from BlackHole.</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
