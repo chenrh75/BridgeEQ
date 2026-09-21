@@ -226,8 +226,59 @@ private final class MeterView: NSView {
     }
 
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat) {
-        text.draw(at: point, withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: size, weight: .regular), .foregroundColor: color])
+        // Keep the continuously-redrawn meters out of AppKit's attributed-text
+        // pipeline. On macOS 27 CoreText can occasionally receive a nil font
+        // attribute here and abort the process before Swift can recover.
+        let pixelSize = max(1, floor(size / 8))
+        let path = NSBezierPath()
+        var x = point.x
+
+        for character in text.uppercased() {
+            if let rows = Self.meterGlyphs[character] {
+                for (rowIndex, row) in rows.enumerated() {
+                    for column in 0..<5 where row & (1 << (4 - column)) != 0 {
+                        path.appendRect(NSRect(
+                            x: x + CGFloat(column) * pixelSize,
+                            y: point.y + CGFloat(6 - rowIndex) * pixelSize,
+                            width: pixelSize,
+                            height: pixelSize
+                        ))
+                    }
+                }
+            }
+            x += 6 * pixelSize
+        }
+
+        color.setFill()
+        path.fill()
     }
+
+    // Five-by-seven glyphs cover every label and numeric value shown by the
+    // meter. Keeping them local also makes drawing deterministic and allocation
+    // free with respect to the system font service.
+    private static let meterGlyphs: [Character: [UInt8]] = [
+        " ": [0, 0, 0, 0, 0, 0, 0],
+        "-": [0, 0, 0, 31, 0, 0, 0],
+        "0": [14, 17, 19, 21, 25, 17, 14],
+        "1": [4, 12, 4, 4, 4, 4, 14],
+        "2": [14, 17, 1, 2, 4, 8, 31],
+        "3": [30, 1, 1, 14, 1, 1, 30],
+        "4": [2, 6, 10, 18, 31, 2, 2],
+        "5": [31, 16, 16, 30, 1, 1, 30],
+        "6": [14, 16, 16, 30, 17, 17, 14],
+        "7": [31, 1, 2, 4, 8, 8, 8],
+        "8": [14, 17, 17, 14, 17, 17, 14],
+        "9": [14, 17, 17, 15, 1, 1, 14],
+        "C": [14, 17, 16, 16, 16, 17, 14],
+        "I": [14, 4, 4, 4, 4, 4, 14],
+        "L": [16, 16, 16, 16, 16, 16, 31],
+        "N": [17, 25, 21, 19, 17, 17, 17],
+        "O": [14, 17, 17, 17, 17, 17, 14],
+        "P": [30, 17, 17, 30, 16, 16, 16],
+        "R": [30, 17, 17, 30, 20, 18, 17],
+        "T": [31, 4, 4, 4, 4, 4, 4],
+        "U": [17, 17, 17, 17, 17, 17, 14]
+    ]
 
     private func position(_ amplitude: Float) -> CGFloat {
         let db = 20 * log10(max(CGFloat(amplitude), 0.001))
