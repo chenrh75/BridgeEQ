@@ -7,8 +7,8 @@
   <key>CFBundleIdentifier</key><string>com.local.BridgeEQ</string>
   <key>CFBundleName</key><string>BridgeEQ</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.4</string>
-  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>0.2.6</string>
+  <key>CFBundleVersion</key><string>7</string>
   <key>LSMultipleInstancesProhibited</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSMicrophoneUsageDescription</key><string>BridgeEQ needs audio-input access to receive system audio from BlackHole.</string>

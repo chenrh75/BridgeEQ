@@ -25,4 +25,4 @@ BridgeEQ is a native Apple-silicon macOS app that routes system audio from a vir
 
 To build from source, open `HeadphoneEQ.xcodeproj`, select **My Mac**, and press Run. The built product is named **BridgeEQ**.
 
-The included standalone build is BridgeEQ 0.2.4 (build 5), locally signed rather than Apple-notarized. On first launch, you may need to Control-click `BridgeEQ.app` and choose **Open**.
+The included standalone build is BridgeEQ 0.2.6 (build 7), locally signed rather than Apple-notarized. On first launch, you may need to Control-click `BridgeEQ.app` and choose **Open**.

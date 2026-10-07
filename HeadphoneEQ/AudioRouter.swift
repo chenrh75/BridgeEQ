@@ -128,17 +128,26 @@ final class AudioRouter: ObservableObject {
         apply(preset, eq: eq, mixer: mixer)
         installMeter(on: mixer, bus: 0, input: false)
         outputEngine.prepare()
-        try outputEngine.start()
-        player.play()
+        do {
+            try outputEngine.start()
+            player.play()
 
-        let capture = try HALInputCapture(deviceID: input.id, format: processingFormat, player: player, levels: inputLevels)
-        try capture.start()
-        self.inputCapture = capture; self.outputEngine = outputEngine; self.player = player
-        self.eq = eq; self.gainMixer = mixer
-        routeInputDeviceID = input.id
-        lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
-        running = true; status = "Routing \(input.name) → \(output.name)"
-        startMeterTimer()
+            let capture = try HALInputCapture(deviceID: input.id, format: processingFormat, player: player, levels: inputLevels)
+            try capture.start()
+            self.inputCapture = capture; self.outputEngine = outputEngine; self.player = player
+            self.eq = eq; self.gainMixer = mixer
+            routeInputDeviceID = input.id
+            lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
+            running = true; status = "Routing \(input.name) → \(output.name)"
+            startMeterTimer()
+        } catch {
+            // A capture failure can happen after the output engine has started.
+            // Tear down the partial route before allowing another start attempt.
+            player.stop()
+            outputEngine.stop()
+            mixer.removeTap(onBus: 0)
+            throw error
+        }
     }
 
     func stop() {

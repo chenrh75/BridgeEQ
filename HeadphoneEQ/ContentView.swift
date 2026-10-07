@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
+import CoreText
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
@@ -210,7 +211,7 @@ private final class MeterView: NSView {
     }
 
     private func drawChannel(_ channel: String, value: Float, hold: Float, clipped: Bool, x: CGFloat, y: CGFloat) {
-        drawText(channel, at: CGPoint(x: x, y: y - 3), color: .secondaryLabelColor, size: 9)
+        drawText(channel, at: CGPoint(x: x, y: y), color: .secondaryLabelColor, size: 9)
         let bar = NSRect(x: x + 13, y: y, width: 92, height: 7)
         NSColor.secondaryLabelColor.withAlphaComponent(0.18).setFill()
         NSBezierPath(roundedRect: bar, xRadius: 4, yRadius: 4).fill()
@@ -222,63 +223,71 @@ private final class MeterView: NSView {
         NSColor.white.setFill()
         NSRect(x: bar.minX + min(bar.width - 2, max(0, bar.width * position(hold) - 1)), y: y, width: 2, height: 7).fill()
         let text = clipped ? "CLIP" : String(format: "%3.0f", 20 * log10(max(Double(value), 0.001)))
-        drawText(text, at: CGPoint(x: x + 109, y: y - 3), color: clipped ? .systemRed : .secondaryLabelColor, size: 9)
+        drawText(text, at: CGPoint(x: x + 109, y: y), color: clipped ? .systemRed : .secondaryLabelColor, size: 9)
     }
 
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat) {
-        // Keep the continuously-redrawn meters out of AppKit's attributed-text
-        // pipeline. On macOS 27 CoreText can occasionally receive a nil font
-        // attribute here and abort the process before Swift can recover.
-        let pixelSize = max(1, floor(size / 8))
-        let path = NSBezierPath()
+        // Draw cached glyph outlines instead of creating attributed strings.
+        // This keeps the macOS 27 CoreText attribute-dictionary crash out of
+        // the meter's continuously-redrawn path while retaining crisp text.
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let font = size >= 10 ? Self.labelMeterFont : Self.valueMeterFont
         var x = point.x
 
+        context.saveGState()
+        context.beginPath()
         for character in text.uppercased() {
-            if let rows = Self.meterGlyphs[character] {
-                for (rowIndex, row) in rows.enumerated() {
-                    for column in 0..<5 where row & (1 << (4 - column)) != 0 {
-                        path.appendRect(NSRect(
-                            x: x + CGFloat(column) * pixelSize,
-                            y: point.y + CGFloat(6 - rowIndex) * pixelSize,
-                            width: pixelSize,
-                            height: pixelSize
-                        ))
-                    }
-                }
+            guard let glyph = font.glyphs[character] else {
+                x += font.fallbackAdvance
+                continue
             }
-            x += 6 * pixelSize
+            if let path = glyph.path {
+                context.saveGState()
+                context.translateBy(x: x, y: point.y)
+                context.addPath(path)
+                context.restoreGState()
+            }
+            x += glyph.advance
         }
-
-        color.setFill()
-        path.fill()
+        context.setFillColor((color.usingColorSpace(.deviceRGB) ?? color).cgColor)
+        context.fillPath()
+        context.restoreGState()
     }
 
-    // Five-by-seven glyphs cover every label and numeric value shown by the
-    // meter. Keeping them local also makes drawing deterministic and allocation
-    // free with respect to the system font service.
-    private static let meterGlyphs: [Character: [UInt8]] = [
-        " ": [0, 0, 0, 0, 0, 0, 0],
-        "-": [0, 0, 0, 31, 0, 0, 0],
-        "0": [14, 17, 19, 21, 25, 17, 14],
-        "1": [4, 12, 4, 4, 4, 4, 14],
-        "2": [14, 17, 1, 2, 4, 8, 31],
-        "3": [30, 1, 1, 14, 1, 1, 30],
-        "4": [2, 6, 10, 18, 31, 2, 2],
-        "5": [31, 16, 16, 30, 1, 1, 30],
-        "6": [14, 16, 16, 30, 17, 17, 14],
-        "7": [31, 1, 2, 4, 8, 8, 8],
-        "8": [14, 17, 17, 14, 17, 17, 14],
-        "9": [14, 17, 17, 15, 1, 1, 14],
-        "C": [14, 17, 16, 16, 16, 17, 14],
-        "I": [14, 4, 4, 4, 4, 4, 14],
-        "L": [16, 16, 16, 16, 16, 16, 31],
-        "N": [17, 25, 21, 19, 17, 17, 17],
-        "O": [14, 17, 17, 17, 17, 17, 14],
-        "P": [30, 17, 17, 30, 16, 16, 16],
-        "R": [30, 17, 17, 30, 20, 18, 17],
-        "T": [31, 4, 4, 4, 4, 4, 4],
-        "U": [17, 17, 17, 17, 17, 17, 14]
-    ]
+    private struct MeterGlyph {
+        let path: CGPath?
+        let advance: CGFloat
+    }
+
+    private final class MeterFont {
+        let glyphs: [Character: MeterGlyph]
+        let fallbackAdvance: CGFloat
+
+        init(size: CGFloat) {
+            let appKitFont = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            let font = CTFontCreateWithName(appKitFont.fontName as CFString, size, nil)
+            var glyphs: [Character: MeterGlyph] = [:]
+
+            for character in " -0123456789CILNOPRTU" {
+                guard let codeUnit = String(character).utf16.first else { continue }
+                var characterCode = UniChar(codeUnit)
+                var glyph = CGGlyph()
+                guard CTFontGetGlyphsForCharacters(font, &characterCode, &glyph, 1) else { continue }
+                var advance = CGSize.zero
+                CTFontGetAdvancesForGlyphs(font, .horizontal, &glyph, &advance, 1)
+                glyphs[character] = MeterGlyph(
+                    path: CTFontCreatePathForGlyph(font, glyph, nil),
+                    advance: advance.width
+                )
+            }
+
+            self.glyphs = glyphs
+            fallbackAdvance = glyphs[" "]?.advance ?? size * 0.6
+        }
+    }
+
+    private static let valueMeterFont = MeterFont(size: 9)
+    private static let labelMeterFont = MeterFont(size: 10)
 
     private func position(_ amplitude: Float) -> CGFloat {
         let db = 20 * log10(max(CGFloat(amplitude), 0.001))

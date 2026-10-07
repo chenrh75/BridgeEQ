@@ -48,6 +48,7 @@ final class CoreAudioDevices {
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr else { return [] }
         let devices: [AudioDevice] = ids.compactMap { id in
             guard let name = string(id, kAudioObjectPropertyName), let uid = string(id, kAudioDevicePropertyDeviceUID) else { return nil }
+            guard !isPrivateAggregate(id, name: name) else { return nil }
             let inputChannels = channels(id, kAudioObjectPropertyScopeInput)
             let outputChannels = channels(id, kAudioObjectPropertyScopeOutput)
             return AudioDevice(id: id, uid: uid, name: name, inputChannels: inputChannels, outputChannels: outputChannels)
@@ -65,6 +66,36 @@ final class CoreAudioDevices {
         guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr,
               let value else { return nil }
         return value.takeUnretainedValue() as String
+    }
+
+    private static func isPrivateAggregate(_ id: AudioObjectID, name: String) -> Bool {
+        // Core Audio creates this process-private device while AVAudioEngine is
+        // running. It is an implementation detail, not a route the user can
+        // meaningfully select. Keep the name check as a fallback because some
+        // OS versions omit the private flag from the composition dictionary.
+        if name.hasPrefix("CADefaultDeviceAggregate-") { return true }
+        guard uint32(id, kAudioObjectPropertyClass) == kAudioAggregateDeviceClassID,
+              let composition = dictionary(id, kAudioAggregateDevicePropertyComposition) else { return false }
+        if let isPrivate = composition[kAudioAggregateDeviceIsPrivateKey] as? Bool { return isPrivate }
+        return (composition[kAudioAggregateDeviceIsPrivateKey] as? NSNumber)?.boolValue == true
+    }
+
+    private static func uint32(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value
+    }
+
+    private static func dictionary(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> [String: Any]? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectHasProperty(id, &address) else { return nil }
+        var value: Unmanaged<CFDictionary>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFDictionary>?>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr,
+              let value else { return nil }
+        return value.takeUnretainedValue() as? [String: Any]
     }
 
     private static func channels(_ id: AudioObjectID, _ scope: AudioObjectPropertyScope) -> Int {
