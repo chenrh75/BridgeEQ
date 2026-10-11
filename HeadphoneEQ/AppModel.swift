@@ -5,61 +5,73 @@ import UniformTypeIdentifiers
 @MainActor
 final class AppModel: ObservableObject {
     @Published var devices: [AudioDevice] = []
-    @Published var inputUID = "" { didSet { saveState() } }
-    @Published var outputUID = "" { didSet { saveState() } }
+    @Published var outputUID = "" { didSet {
+        saveState()
+        if outputUID != oldValue, router.running || router.recovering { scheduleRecovery() }
+    } }
     @Published var preset: EQPreset = .flat { didSet { router.update(preset); saveState() } }
     @Published var presets: [EQPreset] = []
     @Published var errorMessage: String?
     let router = AudioRouter()
     private var retryTask: Task<Void, Never>?
     private let defaults = UserDefaults.standard
+    private var restoringState = true
 
-    var inputs: [AudioDevice] { devices.filter { $0.inputChannels > 0 } }
-    var outputs: [AudioDevice] { devices.filter { $0.outputChannels > 0 } }
-    var selectedInput: AudioDevice? { devices.first { $0.uid == inputUID } }
+    var outputs: [AudioDevice] { devices.filter { $0.outputChannels > 0 && CoreAudioDevices.isPhysicalOutput($0.id) } }
     var selectedOutput: AudioDevice? { devices.first { $0.uid == outputUID } }
 
     init() {
-        loadState(); refreshDevices()
+        loadState()
+        restoringState = false
+        refreshDevices()
         router.onRecoveryNeeded = { [weak self] in self?.scheduleRecovery() }
         if ProcessInfo.processInfo.arguments.contains("--smoke-test-route") {
             let routeTestSeconds = ProcessInfo.processInfo.environment["BRIDGEEQ_ROUTE_TEST_SECONDS"]
                 .flatMap(Double.init) ?? 2
+            let requireAudio = ProcessInfo.processInfo.environment["BRIDGEEQ_SMOKE_REQUIRE_AUDIO"] == "1"
             Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(500))
                 guard let self else { Foundation.exit(2) }
-                self.toggle()
-                try? await Task.sleep(for: .seconds(routeTestSeconds))
-                if self.router.running {
-                    print("ROUTE_SMOKE_TEST_PASSED: \(self.router.status)")
-                    self.router.stop()
-                    Foundation.exit(0)
-                } else {
-                    print("ROUTE_SMOKE_TEST_FAILED: \(self.errorMessage ?? self.router.status)")
-                    Foundation.exit(2)
+                let originalDefault = CoreAudioDevices.defaultOutputDeviceID()
+                if requireAudio, let output = self.selectedOutput {
+                    // Test a known attenuation without changing saved presets.
+                    var testPreset = EQPreset.flat
+                    testPreset.preamp = -12
+                    do { try self.router.start(output: output, preset: testPreset) }
+                    catch { self.errorMessage = error.localizedDescription }
+                } else { self.toggle() }
+                let deadline = Date().addingTimeInterval(routeTestSeconds)
+                var inputPeak: Float = 0, outputPeak: Float = 0
+                while Date() < deadline {
+                    try? await Task.sleep(for: .milliseconds(50))
+                    inputPeak = max(inputPeak, self.router.meters.state.inputLeftHold)
+                    outputPeak = max(outputPeak, self.router.meters.state.outputLeftHold)
                 }
+                let gainDB = inputPeak > 0 && outputPeak > 0 ? 20 * log10(outputPeak / inputPeak) : Float.infinity
+                let status = self.router.status
+                let passed = self.router.running && CoreAudioDevices.defaultOutputDeviceID() == originalDefault
+                    && (!requireAudio || (inputPeak > 0.00001 && outputPeak > 0.00001 && abs(gainDB + 12) < 1))
+                self.router.stop()
+                if requireAudio { print("ROUTE_SIGNAL: inputPeak=\(inputPeak), outputPeak=\(outputPeak), gainDB=\(gainDB)") }
+                print("\(passed ? "ROUTE_SMOKE_TEST_PASSED" : "ROUTE_SMOKE_TEST_FAILED"): \(self.errorMessage ?? status)")
+                Foundation.exit(passed ? 0 : 2)
             }
         }
     }
 
     func refreshDevices() {
         devices = CoreAudioDevices.all()
-        if !inputs.contains(where: { $0.uid == inputUID }) { inputUID = inputs.first(where: { $0.name.localizedCaseInsensitiveContains("BlackHole") })?.uid ?? inputs.first?.uid ?? "" }
-        if !outputs.contains(where: { $0.uid == outputUID }) { outputUID = outputs.first(where: { !$0.name.localizedCaseInsensitiveContains("BlackHole") })?.uid ?? outputs.first?.uid ?? "" }
+        // Keep a disconnected selection while recovering; do not unexpectedly
+        // send headphone audio to speakers when a DAC is unplugged.
+        if !router.recovering, !outputs.contains(where: { $0.uid == outputUID }) {
+            outputUID = outputs.first(where: { $0.id == CoreAudioDevices.defaultOutputDeviceID() })?.uid ?? outputs.first?.uid ?? ""
+        }
     }
 
     func toggle() {
-        if router.running { retryTask?.cancel(); router.stop(); return }
-        guard let input = selectedInput, let output = selectedOutput else { errorMessage = "Choose an available input and output device."; return }
-        guard input.uid != output.uid else {
-            errorMessage = "Input and output must be different devices. Choose BlackHole 2ch as Input and your headphones or DAC as Output."
-            return
-        }
-        guard !output.name.localizedCaseInsensitiveContains("BlackHole") else {
-            errorMessage = "BlackHole should be the Input, not the Output. Choose your headphones, built-in output, or DAC as Output."
-            return
-        }
-        do { try router.start(input: input, output: output, preset: preset) }
+        if router.running || router.recovering { retryTask?.cancel(); router.stop(); return }
+        guard let output = selectedOutput else { errorMessage = "Choose an available headphones, speakers, or DAC output."; return }
+        do { try router.start(output: output, preset: preset) }
         catch { errorMessage = error.localizedDescription }
     }
 
@@ -80,26 +92,36 @@ final class AppModel: ObservableObject {
 
     private func scheduleRecovery() {
         retryTask?.cancel()
+        router.beginRecovery()
         retryTask = Task { [weak self] in
             for _ in 0..<8 {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, let self else { return }
                 self.refreshDevices()
-                guard let i = self.selectedInput, let o = self.selectedOutput else { continue }
-                if (try? self.router.start(input: i, output: o, preset: self.preset)) != nil { return }
+                guard let o = self.selectedOutput else { continue }
+                do {
+                    try self.router.start(output: o, preset: self.preset)
+                    return
+                } catch {
+                    self.router.beginRecovery()
+                }
             }
+            guard !Task.isCancelled else { return }
+            self?.router.stop()
             self?.errorMessage = "The audio devices did not reconnect. Check the connections, then press Start."
         }
     }
 
     private func loadState() {
-        inputUID = defaults.string(forKey: "inputUID") ?? ""
         outputUID = defaults.string(forKey: "outputUID") ?? ""
         if let data = defaults.data(forKey: "currentPreset"), let value = try? JSONDecoder().decode(EQPreset.self, from: data) { preset = value }
         if let data = defaults.data(forKey: "presets"), let value = try? JSONDecoder().decode([EQPreset].self, from: data) { presets = value }
     }
     private func saveState() {
-        defaults.set(inputUID, forKey: "inputUID"); defaults.set(outputUID, forKey: "outputUID")
+        // Loading the output selection must not overwrite the preset before
+        // loadState has read it from defaults.
+        guard !restoringState else { return }
+        defaults.set(outputUID, forKey: "outputUID")
         defaults.set(try? JSONEncoder().encode(preset), forKey: "currentPreset")
     }
     private func persistPresets() { defaults.set(try? JSONEncoder().encode(presets), forKey: "presets") }

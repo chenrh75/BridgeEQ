@@ -11,7 +11,7 @@ enum AudioDeviceError: LocalizedError {
         switch self {
         case let .osStatus(status, operation):
             if status == kAudioUnitErr_FormatNotSupported {
-                return "The selected devices could not agree on an audio format. Choose BlackHole as Input and headphones or a DAC as Output, then try again."
+                return "System audio and the selected output could not agree on an audio format. Choose headphones or a DAC, then try again."
             }
             return "\(operation) failed (Core Audio \(status))."
         case let .inputFormatUnavailable(name):
@@ -23,6 +23,10 @@ enum AudioDeviceError: LocalizedError {
 }
 
 final class CoreAudioDevices {
+    static func isPhysicalOutput(_ id: AudioDeviceID) -> Bool {
+        guard let transport = uint32(id, kAudioDevicePropertyTransportType) else { return false }
+        return transport != kAudioDeviceTransportTypeVirtual && transport != kAudioDeviceTransportTypeAggregate
+    }
     static func defaultOutputDeviceID() -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         var device = AudioDeviceID(kAudioObjectUnknown)
@@ -110,50 +114,8 @@ final class CoreAudioDevices {
     }
 }
 
-enum AggregateAudioDevice {
-    static func create(input: AudioDevice, output: AudioDevice) throws -> AudioDeviceID {
-        let uid = "com.example.HeadphoneEQ.\(UUID().uuidString)"
-        let subdevices: [[String: Any]] = [
-            [kAudioSubDeviceUIDKey: output.uid,
-             kAudioSubDeviceDriftCompensationKey: false],
-            [kAudioSubDeviceUIDKey: input.uid,
-             kAudioSubDeviceDriftCompensationKey: true]
-        ]
-        let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "Headphone EQ Private Route",
-            kAudioAggregateDeviceUIDKey: uid,
-            kAudioAggregateDeviceSubDeviceListKey: subdevices,
-            kAudioAggregateDeviceMainSubDeviceKey: output.uid,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false
-        ]
-        var deviceID = AudioDeviceID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &deviceID)
-        guard status == noErr else { throw AudioDeviceError.osStatus(status, "Create private aggregate device") }
-        return deviceID
-    }
-
-    static func destroy(_ deviceID: AudioDeviceID) {
-        guard deviceID != kAudioObjectUnknown else { return }
-        AudioHardwareDestroyAggregateDevice(deviceID)
-    }
-}
-
-func selectInputDevice(_ id: AudioDeviceID, on node: AVAudioInputNode) throws {
-    try selectDevice(id, audioUnit: node.audioUnit)
-}
-
 func selectOutputDevice(_ id: AudioDeviceID, on node: AVAudioOutputNode) throws {
     try selectDevice(id, audioUnit: node.audioUnit)
-}
-
-func selectBlackHoleInputChannels(on node: AVAudioInputNode, physicalInputChannels: Int, virtualInputChannels: Int) throws {
-    guard let audioUnit = node.audioUnit else { throw AudioDeviceError.osStatus(-1, "Access input audio unit") }
-    let map = (0..<virtualInputChannels).map { Int32(physicalInputChannels + $0) }
-    let status = map.withUnsafeBytes { bytes in
-        AudioUnitSetProperty(audioUnit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1, bytes.baseAddress, UInt32(bytes.count))
-    }
-    guard status == noErr else { throw AudioDeviceError.osStatus(status, "Select BlackHole input channels") }
 }
 
 private func selectDevice(_ id: AudioDeviceID, audioUnit: AudioUnit?) throws {

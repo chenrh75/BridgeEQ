@@ -30,6 +30,9 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            model.router.stop()
+        }
         .alert("BridgeEQ", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) { Button("OK") { model.errorMessage = nil } } message: { Text(model.errorMessage ?? "") }
         .confirmationDialog(
             "Delete preset “\(presetToDelete?.name ?? "")”?",
@@ -56,9 +59,9 @@ struct ContentView: View {
 
     private var devices: some View {
         GroupBox {
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                GridRow { Text("Input"); Picker("Input", selection: $model.inputUID) { ForEach(model.inputs) { Text($0.label).tag($0.uid) } }.labelsHidden() }
-                GridRow { Text("Output"); Picker("Output", selection: $model.outputUID) { ForEach(model.outputs) { Text($0.label).tag($0.uid) } }.labelsHidden() }
+            HStack(spacing: 12) {
+                Text("Output")
+                Picker("Output", selection: $model.outputUID) { ForEach(model.outputs) { Text($0.label).tag($0.uid) } }.labelsHidden()
             }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6).padding(.vertical, 5)
         } label: {
             HStack {
@@ -141,8 +144,8 @@ private struct RouterHeader: View {
             MeterDisplay(meters: router.meters)
                 .frame(width: 282, height: 38)
                 .fixedSize()
-            Button(router.running ? "Stop" : "Start", action: toggle)
-                .buttonStyle(.borderedProminent).tint(router.running ? .red : .accentColor)
+            Button(router.running || router.recovering ? "Stop" : "Start", action: toggle)
+                .buttonStyle(.borderedProminent).tint(router.running || router.recovering ? .red : .accentColor)
         }
     }
 }

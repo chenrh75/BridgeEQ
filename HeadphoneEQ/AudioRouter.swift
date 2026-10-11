@@ -32,10 +32,12 @@ private func measureLevels(_ buffer: AVAudioPCMBuffer) -> StereoMeterLevels {
 @MainActor
 final class AudioRouter: ObservableObject {
     @Published private(set) var running = false
+    @Published private(set) var recovering = false
     @Published private(set) var status = "Stopped"
     let meters = MeterModel()
 
-    private var inputCapture: HALInputCapture?
+    private var inputCapture: TapInputCapture?
+    private var systemTap: SystemAudioTap?
     private var outputEngine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
     private var eq: AVAudioUnitEQ?
@@ -43,7 +45,8 @@ final class AudioRouter: ObservableObject {
     private var configObserver: NSObjectProtocol?
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     private var meterTimer: Timer?
-    private var routeInputDeviceID: AudioDeviceID?
+    private var outputDeviceID: AudioDeviceID?
+    private var outputDeviceListener: AudioObjectPropertyListenerBlock?
     private var lastDefaultOutputDeviceID: AudioDeviceID?
     private let inputLevels = MeterAccumulator()
     private let outputLevels = MeterAccumulator()
@@ -53,12 +56,15 @@ final class AudioRouter: ObservableObject {
     // actually exceed 0 dBFS are overs; near-full-scale legal samples are not.
     private static let clipThreshold: Float = 1.0
     private var ignoreConfigurationChangesUntil = Date.distantPast
+    private var routeGeneration = 0
     var onRecoveryNeeded: (() -> Void)?
 
     init() {
-        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] notification in
             Task { @MainActor in
-                self?.requestRecovery(reason: "Audio configuration changed; reconnecting…")
+                guard let self, let engine = notification.object as? AVAudioEngine,
+                      engine === self.outputEngine, Date() >= self.ignoreConfigurationChangesUntil else { return }
+                self.requestRecovery(reason: "Audio configuration changed; reconnecting…")
             }
         }
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -85,38 +91,41 @@ final class AudioRouter: ObservableObject {
     }
 
     private func requestRecovery(reason: String) {
-        guard (running || inputCapture != nil), Date() >= ignoreConfigurationChangesUntil else { return }
+        guard running else { return }
+        if Date() < ignoreConfigurationChangesUntil {
+            let delay = max(0.05, ignoreConfigurationChangesUntil.timeIntervalSinceNow + 0.05)
+            let generation = routeGeneration
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard let self, self.routeGeneration == generation else { return }
+                self.requestRecovery(reason: reason)
+            }
+            return
+        }
+        beginRecovery()
         status = reason
-        running = false
         onRecoveryNeeded?()
     }
 
     private func checkSystemOutputChange() {
         guard let current = CoreAudioDevices.defaultOutputDeviceID(), current != lastDefaultOutputDeviceID else { return }
         lastDefaultOutputDeviceID = current
-        guard current == routeInputDeviceID else { return }
-        if Date() < ignoreConfigurationChangesUntil {
-            let delay = ignoreConfigurationChangesUntil.timeIntervalSinceNow + 0.05
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(max(delay, 0.05)))
-                guard let self, CoreAudioDevices.defaultOutputDeviceID() == self.routeInputDeviceID else { return }
-                self.requestRecovery(reason: "BlackHole became system output; reconnecting…")
-            }
-            return
-        }
-        requestRecovery(reason: "BlackHole became system output; reconnecting…")
+        requestRecovery(reason: "System output changed; reconnecting…")
     }
 
-    func start(input: AudioDevice, output: AudioDevice, preset: EQPreset) throws {
+    func start(output: AudioDevice, preset: EQPreset) throws {
         stop()
+        guard CoreAudioDevices.isPhysicalOutput(output.id) else {
+            throw AudioDeviceError.invalidRoute("Choose a physical output: headphones, speakers, or a DAC.")
+        }
         ignoreConfigurationChangesUntil = Date().addingTimeInterval(3)
         let outputEngine = AVAudioEngine()
         try selectOutputDevice(output.id, on: outputEngine.outputNode)
 
-        let inputRate = try CoreAudioDevices.nominalSampleRate(input.id)
-        guard let processingFormat = AVAudioFormat(standardFormatWithSampleRate: inputRate,
-                                                   channels: AVAudioChannelCount(min(input.inputChannels, 2))) else {
-            throw AudioDeviceError.inputFormatUnavailable(input.name)
+        // Start the engine first so Core Audio has a process object we can
+        // exclude. Do not start reading/muting the tap before playback is ready.
+        guard let processingFormat = AVAudioFormat(standardFormatWithSampleRate: try CoreAudioDevices.nominalSampleRate(output.id), channels: 2) else {
+            throw AudioDeviceError.inputFormatUnavailable(output.name)
         }
         let eq = AVAudioUnitEQ(numberOfBands: max(preset.bands.count, 1))
         let mixer = AVAudioMixerNode()
@@ -132,13 +141,29 @@ final class AudioRouter: ObservableObject {
             try outputEngine.start()
             player.play()
 
-            let capture = try HALInputCapture(deviceID: input.id, format: processingFormat, player: player, levels: inputLevels)
+            let tap = try SystemAudioTap()
+            if tap.format.sampleRate != processingFormat.sampleRate {
+                // The tap can follow a different default output sample rate.
+                // AVAudioEngine converts from its native rate to the output rate.
+                outputEngine.pause()
+                player.stop()
+                mixer.removeTap(onBus: 0)
+                outputEngine.disconnectNodeOutput(player)
+                outputEngine.disconnectNodeOutput(eq)
+                outputEngine.connect(player, to: eq, format: tap.format)
+                outputEngine.connect(eq, to: mixer, format: tap.format)
+                installMeter(on: mixer, bus: 0, input: false)
+                try outputEngine.start()
+                player.play()
+            }
+            let capture = try TapInputCapture(tap: tap, player: player, levels: inputLevels)
             try capture.start()
             self.inputCapture = capture; self.outputEngine = outputEngine; self.player = player
+            self.systemTap = tap
             self.eq = eq; self.gainMixer = mixer
-            routeInputDeviceID = input.id
+            observeOutput(output.id)
             lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
-            running = true; status = "Routing \(input.name) → \(output.name)"
+            running = true; status = "System audio → \(output.name)"
             startMeterTimer()
         } catch {
             // A capture failure can happen after the output engine has started.
@@ -150,19 +175,67 @@ final class AudioRouter: ObservableObject {
         }
     }
 
+    private static let outputSelectors: [AudioObjectPropertySelector] = [
+        kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyStreamConfiguration
+    ]
+
+    private func observeOutput(_ id: AudioDeviceID) {
+        outputDeviceID = id
+        let generation = routeGeneration
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in
+                guard let self, self.routeGeneration == generation else { return }
+                self.requestRecovery(reason: "Output device changed; reconnecting…")
+            }
+        }
+        outputDeviceListener = listener
+        for selector in Self.outputSelectors {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            if selector == kAudioDevicePropertyStreamConfiguration { address.mScope = kAudioObjectPropertyScopeOutput }
+            AudioObjectAddPropertyListenerBlock(id, &address, .main, listener)
+        }
+    }
+
+    func beginRecovery() {
+        stop()
+        recovering = true
+        status = "Reconnecting system audio…"
+    }
+
     func stop() {
+        routeGeneration += 1
         meterTimer?.invalidate(); meterTimer = nil
         gainMixer?.removeTap(onBus: 0)
         inputCapture?.stop(); player?.stop(); outputEngine?.stop()
+        systemTap?.stop(); systemTap = nil
+        if let id = outputDeviceID, let listener = outputDeviceListener {
+            for selector in Self.outputSelectors {
+                var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                if selector == kAudioDevicePropertyStreamConfiguration { address.mScope = kAudioObjectPropertyScopeOutput }
+                AudioObjectRemovePropertyListenerBlock(id, &address, .main, listener)
+            }
+        }
+        outputDeviceID = nil; outputDeviceListener = nil
         inputCapture = nil; outputEngine = nil; player = nil; eq = nil; gainMixer = nil
-        routeInputDeviceID = nil; lastDefaultOutputDeviceID = nil
+        lastDefaultOutputDeviceID = nil
         _ = inputLevels.drain(); _ = outputLevels.drain()
         holdUntil = [TimeInterval](repeating: 0, count: 4)
         clipUntil = [TimeInterval](repeating: 0, count: 4)
-        running = false; status = "Stopped"; meters.state = MeterState()
+        running = false; recovering = false; status = "Stopped"; meters.state = MeterState()
     }
 
-    func update(_ preset: EQPreset) { if let eq, let gainMixer { apply(preset, eq: eq, mixer: gainMixer) } }
+    func update(_ preset: EQPreset) {
+        guard let eq, let gainMixer else { return }
+        if eq.bands.count != max(preset.bands.count, 1) {
+            // AVAudioUnitEQ cannot resize its bands in place. Rebuild when
+            // adding/deleting bands or loading a preset with a different size.
+            beginRecovery()
+            onRecoveryNeeded?()
+            return
+        }
+        apply(preset, eq: eq, mixer: gainMixer)
+    }
 
     private func apply(_ preset: EQPreset, eq: AVAudioUnitEQ, mixer: AVAudioMixerNode) {
         eq.globalGain = Float(preset.preamp)
@@ -276,58 +349,142 @@ private final class MeterAccumulator: @unchecked Sendable {
     }
 }
 
-private final class HALInputCapture: @unchecked Sendable {
-    private var unit: AudioUnit?
-    private let format: AVAudioFormat
+// Owns the tap and its private input-only aggregate. The aggregate is never
+// selected as macOS output and disappears when the route ends.
+private final class SystemAudioTap {
+    private(set) var tapID = AudioObjectID(kAudioObjectUnknown)
+    private(set) var deviceID = AudioDeviceID(kAudioObjectUnknown)
+    private(set) var format: AVAudioFormat!
+    private(set) var sourceFormat = AudioStreamBasicDescription()
+
+    init() throws {
+        do {
+            var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+                mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            var pid = getpid()
+            var processID = AudioObjectID(kAudioObjectUnknown)
+            var size = UInt32(MemoryLayout<AudioObjectID>.size)
+            try check(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address,
+                UInt32(MemoryLayout<pid_t>.size), &pid, &size, &processID), "Find BridgeEQ audio process")
+            guard processID != kAudioObjectUnknown else {
+                throw AudioDeviceError.invalidRoute("Could not exclude BridgeEQ from system capture. Restart the app and try again.")
+            }
+            let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [processID])
+            description.name = "BridgeEQ System Audio"
+            description.isPrivate = true
+            // Unlike unconditional mute, this restores ordinary playback when
+            // the input client stops, including startup failures.
+            description.muteBehavior = .mutedWhenTapped
+            try check(AudioHardwareCreateProcessTap(description, &tapID), "Create system audio tap")
+
+            address.mSelector = kAudioTapPropertyFormat
+            size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            try check(AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &sourceFormat), "Read system audio format")
+            guard sourceFormat.mFormatID == kAudioFormatLinearPCM,
+                  sourceFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+                  sourceFormat.mBitsPerChannel == 32, sourceFormat.mChannelsPerFrame == 2,
+                  sourceFormat.mSampleRate > 0,
+                  let format = AVAudioFormat(standardFormatWithSampleRate: sourceFormat.mSampleRate, channels: 2) else {
+                throw AudioDeviceError.invalidRoute("System audio did not provide a supported stereo Float32 format.")
+            }
+            self.format = format
+            let composition: [String: Any] = [
+                kAudioAggregateDeviceNameKey: "BridgeEQ Private System Capture",
+                kAudioAggregateDeviceUIDKey: "com.local.BridgeEQ.tap.\(UUID().uuidString)",
+                kAudioAggregateDeviceIsPrivateKey: true,
+                kAudioAggregateDeviceIsStackedKey: false,
+                // Do not wait for another app to play before Start returns.
+                kAudioAggregateDeviceTapAutoStartKey: false,
+                kAudioAggregateDeviceTapListKey: [[
+                    kAudioSubTapUIDKey: description.uuid.uuidString,
+                    kAudioSubTapDriftCompensationKey: true
+                ]]
+            ]
+            try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &deviceID),
+                      "Create private system audio route")
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    func stop() {
+        if deviceID != kAudioObjectUnknown {
+            AudioHardwareDestroyAggregateDevice(deviceID)
+            deviceID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != kAudioObjectUnknown {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
+        }
+    }
+
+    deinit { stop() }
+}
+
+private final class TapInputCapture: @unchecked Sendable {
+    private let tap: SystemAudioTap
+    private var ioProc: AudioDeviceIOProcID?
     private weak var player: AVAudioPlayerNode?
     private let levels: MeterAccumulator
     private let buffers = OSAllocatedUnfairLock(initialState: [AVAudioPCMBuffer]())
 
-    init(deviceID: AudioDeviceID, format: AVAudioFormat, player: AVAudioPlayerNode,
-         levels: MeterAccumulator) throws {
-        self.format = format; self.player = player; self.levels = levels
-        var description = AudioComponentDescription(componentType: kAudioUnitType_Output,
-                                                    componentSubType: kAudioUnitSubType_HALOutput,
-                                                    componentManufacturer: kAudioUnitManufacturer_Apple,
-                                                    componentFlags: 0, componentFlagsMask: 0)
-        guard let component = AudioComponentFindNext(nil, &description) else { throw AudioDeviceError.osStatus(-1, "Find HAL audio unit") }
-        var created: AudioUnit?
-        try check(AudioComponentInstanceNew(component, &created), "Create HAL audio unit")
-        guard let created else { throw AudioDeviceError.osStatus(-1, "Create HAL audio unit") }
-        unit = created
-        var enabled: UInt32 = 1, disabled: UInt32 = 0, device = deviceID
-        try check(AudioUnitSetProperty(created, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enabled, 4), "Enable HAL input")
-        try check(AudioUnitSetProperty(created, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disabled, 4), "Disable HAL output")
-        try check(AudioUnitSetProperty(created, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, 4), "Select input device")
-        var stream = format.streamDescription.pointee
-        try check(AudioUnitSetProperty(created, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &stream, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "Set HAL capture format")
-        var callback = AURenderCallbackStruct(inputProc: halInputCallback,
-                                              inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
-        try check(AudioUnitSetProperty(created, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "Install HAL input callback")
-        try check(AudioUnitInitialize(created), "Initialize HAL input")
-        var maximumFrames: UInt32 = 4096
-        var maximumFramesSize = UInt32(MemoryLayout<UInt32>.size)
-        AudioUnitGetProperty(created, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
-                             &maximumFrames, &maximumFramesSize)
-        let bufferFrameCapacity = maximumFrames
+    init(tap: SystemAudioTap, player: AVAudioPlayerNode, levels: MeterAccumulator) throws {
+        self.tap = tap; self.player = player; self.levels = levels
+        // Preallocate a bounded pool; avoid allocating PCM storage in the callback.
         buffers.withLock { pool in
-            pool = (0..<16).compactMap { _ in
-                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: bufferFrameCapacity)
-            }
+            pool = (0..<16).compactMap { _ in AVAudioPCMBuffer(pcmFormat: tap.format, frameCapacity: 16384) }
+        }
+        try check(AudioDeviceCreateIOProcID(tap.deviceID, tapInputCallback,
+            Unmanaged.passUnretained(self).toOpaque(), &ioProc), "Prepare system audio capture")
+    }
+
+    func start() throws {
+        guard let ioProc else { throw AudioDeviceError.invalidRoute("System audio capture was not initialized.") }
+        let result = AudioDeviceStart(tap.deviceID, ioProc)
+        guard result == noErr else {
+            throw AudioDeviceError.invalidRoute("Could not start system audio capture (Core Audio \(result)). Allow BridgeEQ in System Settings → Privacy & Security → Screen & System Audio Recording, then restart BridgeEQ.")
         }
     }
 
-    func start() throws { guard let unit else { return }; try check(AudioOutputUnitStart(unit), "Start HAL input") }
-    func stop() { if let unit { AudioOutputUnitStop(unit); AudioUnitUninitialize(unit); AudioComponentInstanceDispose(unit) }; unit = nil }
+    func stop() {
+        if let ioProc {
+            AudioDeviceStop(tap.deviceID, ioProc)
+            AudioDeviceDestroyIOProcID(tap.deviceID, ioProc)
+        }
+        ioProc = nil
+    }
+
     deinit { stop() }
 
-    fileprivate func render(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, time: UnsafePointer<AudioTimeStamp>, frames: UInt32) -> OSStatus {
-        guard let unit, let player, let buffer = acquireBuffer(for: frames) else { return noErr }
+    fileprivate func render(_ input: UnsafePointer<AudioBufferList>) -> OSStatus {
+        guard let player else { return noErr }
+        let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        let interleaved = tap.sourceFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        let requiredBuffers = interleaved ? 1 : 2
+        guard source.count == requiredBuffers, let first = source.first,
+              first.mNumberChannels == (interleaved ? 2 : 1),
+              first.mData != nil, first.mDataByteSize > 0 else { return noErr }
+        let bytesPerFrame = UInt32(MemoryLayout<Float>.size * (interleaved ? 2 : 1))
+        let frames = first.mDataByteSize / bytesPerFrame
+        guard frames > 0, let buffer = acquireBuffer(for: frames), let destination = buffer.floatChannelData else { return noErr }
         buffer.frameLength = frames
-        let status = AudioUnitRender(unit, flags, time, 1, frames, buffer.mutableAudioBufferList)
-        guard status == noErr else {
-            release(buffer)
-            return status
+        if interleaved {
+            let samples = first.mData!.assumingMemoryBound(to: Float.self)
+            for index in 0..<Int(frames) {
+                destination[0][index] = samples[index * 2]
+                destination[1][index] = samples[index * 2 + 1]
+            }
+        } else {
+            for channel in 0..<2 {
+                guard let data = source[channel].mData,
+                      source[channel].mNumberChannels == 1,
+                      source[channel].mDataByteSize >= frames * UInt32(MemoryLayout<Float>.size) else {
+                    release(buffer)
+                    return noErr
+                }
+                memcpy(destination[channel], data, Int(frames) * MemoryLayout<Float>.size)
+            }
         }
         levels.accumulate(measureLevels(buffer))
         player.scheduleBuffer(buffer) { [weak self] in self?.release(buffer) }
@@ -351,10 +508,12 @@ private final class HALInputCapture: @unchecked Sendable {
     }
 }
 
-private func halInputCallback(_ refCon: UnsafeMutableRawPointer, _ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-                              _ time: UnsafePointer<AudioTimeStamp>, _ bus: UInt32, _ frames: UInt32,
-                              _ data: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
-    Unmanaged<HALInputCapture>.fromOpaque(refCon).takeUnretainedValue().render(flags: flags, time: time, frames: frames)
+private func tapInputCallback(_ device: AudioObjectID, _ now: UnsafePointer<AudioTimeStamp>,
+                             _ input: UnsafePointer<AudioBufferList>, _ inputTime: UnsafePointer<AudioTimeStamp>,
+                             _ output: UnsafeMutablePointer<AudioBufferList>, _ outputTime: UnsafePointer<AudioTimeStamp>,
+                             _ refCon: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let refCon else { return noErr }
+    return Unmanaged<TapInputCapture>.fromOpaque(refCon).takeUnretainedValue().render(input)
 }
 
 private func check(_ status: OSStatus, _ operation: String) throws {
