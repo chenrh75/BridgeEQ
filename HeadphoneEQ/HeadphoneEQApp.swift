@@ -5,11 +5,14 @@ struct HeadphoneEQApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("BridgeEQ") {
             ContentView().environmentObject(model)
-                .frame(minWidth: 840, minHeight: 520)
+                .frame(minWidth: BridgeEQLayout.windowWidth,
+                       idealWidth: BridgeEQLayout.windowWidth,
+                       maxWidth: BridgeEQLayout.windowWidth, minHeight: 300)
         }
-        .defaultSize(width: 980, height: 680)
+        .defaultSize(width: BridgeEQLayout.windowWidth, height: 480)
+        .windowResizability(.contentSize)
         .commands { CommandGroup(replacing: .newItem) { } }
 
         Window("EQ Curve", id: "eq-curve") {

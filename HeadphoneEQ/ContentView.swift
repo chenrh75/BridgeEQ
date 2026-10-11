@@ -3,6 +3,19 @@ import UniformTypeIdentifiers
 import AppKit
 import CoreText
 
+enum BridgeEQLayout {
+    static let gap: CGFloat = 8
+    static let detailGap: CGFloat = 4
+    static let pageInset: CGFloat = 16
+    static let sectionInset: CGFloat = 0
+    static let typeWidth: CGFloat = 130
+    static let numberWidth: CGFloat = 92
+    static let rowHeight: CGFloat = 28
+    static let windowWidth: CGFloat = 522
+    static let tableWidth: CGFloat = windowWidth - 2 * pageInset
+    static let automaticBandLimit = 5
+}
+
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
@@ -10,26 +23,45 @@ struct ContentView: View {
     @State private var importing = false
     @State private var exporting = false
     @State private var presetToDelete: EQPreset?
+    @State private var namingPreset = false
+    @State private var confirmingReplace = false
+    @FocusState private var presetNameFocused: Bool
+    @State private var windowChromeHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
             RouterHeader(router: model.router, toggle: model.toggle)
-                .frame(maxWidth: 1050)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    devices
-                    controls
-                    bands
-                    presets
-                }
-                .frame(maxWidth: 1050)
-                .padding(16)
                 .frame(maxWidth: .infinity)
+                .padding(.horizontal, BridgeEQLayout.pageInset)
+                .padding(.vertical, 2)
+            Divider()
+            VStack(alignment: .leading, spacing: BridgeEQLayout.pageInset) {
+                devices
+                controls
+                presets
+                Divider()
+                bands
+            }
+            .padding(.horizontal, BridgeEQLayout.pageInset)
+            .padding(.top, BridgeEQLayout.pageInset)
+            .padding(.bottom, 22)
+        }
+        .background(.background)
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: WindowLayoutMetricsKey.self,
+                                       value: WindowLayoutMetrics(contentHeight: geometry.size.height))
             }
         }
+        .onPreferenceChange(WindowLayoutMetricsKey.self) { metrics in
+            if let content = metrics.contentHeight, let list = metrics.listHeight {
+                windowChromeHeight = content - list
+            }
+        }
+        .background(BandWindowSizing(bandCount: model.preset.bands.count,
+                                     contentHeight: windowChromeHeight + bandListHeight,
+                                     hasMeasurements: windowChromeHeight > 0))
+        .sheet(isPresented: $namingPreset) { presetNamingSheet }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.router.stop()
         }
@@ -58,50 +90,82 @@ struct ContentView: View {
     }
 
     private var devices: some View {
-        GroupBox {
-            HStack(spacing: 12) {
-                Text("Output")
-                Picker("Output", selection: $model.outputUID) { ForEach(model.outputs) { Text($0.label).tag($0.uid) } }.labelsHidden()
-            }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6).padding(.vertical, 5)
-        } label: {
-            HStack {
-                Text("Audio route")
-                Spacer()
-                Button("Refresh devices", systemImage: "arrow.clockwise") { model.refreshDevices() }.controlSize(.small)
-            }.frame(maxWidth: .infinity)
+        HStack(spacing: BridgeEQLayout.gap) {
+            Text("Output").fixedSize()
+            CompactPicker(selection: $model.outputUID, options: model.outputs.map { ($0.uid, $0.label) }, accessibilityLabel: "Output device")
+                .frame(maxWidth: .infinity).frame(height: BridgeEQLayout.rowHeight)
+                .help(model.selectedOutput?.label ?? "Choose an output device")
+            Button { model.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
+                .help("Refresh devices").accessibilityLabel("Refresh devices")
         }
     }
 
     private var controls: some View {
-        GroupBox("Signal") {
-            HStack(spacing: 16) {
-                Toggle("Bypass all EQ", isOn: $model.preset.globalBypass)
-                LabeledNumber(label: "Preamp", value: $model.preset.preamp, range: -24...12, suffix: "dB")
-                LabeledNumber(label: "Output", value: $model.preset.outputGain, range: -24...12, suffix: "dB")
-            }.frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6).padding(.vertical, 5)
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Toggle("Bypass EQ", isOn: $model.preset.globalBypass).fixedSize()
+            Spacer(minLength: 20)
+            LabeledNumber(label: "Preamp", value: $model.preset.preamp, range: -24...12, suffix: "dB")
+            Spacer(minLength: 20)
+            LabeledNumber(label: "Output", value: $model.preset.outputGain, range: -24...12, suffix: "dB")
         }
-        .frame(maxWidth: .infinity)
     }
 
     private var bands: some View {
-        GroupBox {
-            VStack(spacing: 5) {
-                ForEach($model.preset.bands) { $band in
-                    HStack(spacing: 8) {
-                        Toggle("", isOn: $band.enabled).labelsHidden()
-                        Picker("Type", selection: $band.type) { ForEach(EQFilterType.allCases) { Text($0.title).tag($0) } }.frame(width: 160)
-                        LabeledNumber(label: "Frequency", value: $band.frequency, range: 10...24000, suffix: "Hz")
-                        LabeledNumber(label: "Gain", value: $band.gain, range: -24...24, suffix: "dB")
-                        LabeledNumber(label: "Q", value: $band.q, range: 0.1...20, suffix: "")
-                        Button(role: .destructive) { model.deleteBand(band.id) } label: { Image(systemName: "trash") }.buttonStyle(.plain)
-                    }.padding(.vertical, 1)
+        UtilitySection {
+            if model.preset.bands.isEmpty {
+                Text("No EQ bands. Use Add band to create one.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minHeight: BridgeEQLayout.rowHeight,
+                           idealHeight: BridgeEQLayout.rowHeight,
+                           maxHeight: .infinity, alignment: .topLeading)
+                    .background(bandViewportMeasurement)
+            } else {
+                VStack(spacing: BridgeEQLayout.detailGap) {
+                    bandColumns {
+                        Color.clear.frame(width: 20, height: 1)
+                        ForEach(["Type", "Frequency · Hz", "Gain · dB", "Q"], id: \.self) { title in
+                            Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+                                .padding(.leading, title == "Type" ? BridgeEQLayout.gap : 0)
+                                .padding(.trailing, title == "Type" ? 0 : BridgeEQLayout.detailGap)
+                                .lineLimit(1)
+                                .frame(width: title == "Type" ? BridgeEQLayout.typeWidth : BridgeEQLayout.numberWidth, alignment: title == "Type" ? .leading : .trailing)
+                        }
+                        Color.clear.frame(width: 24, height: 1)
+                    }
+                    ScrollView {
+                        LazyVStack(spacing: BridgeEQLayout.gap) {
+                            ForEach($model.preset.bands) { $band in
+                                bandColumns {
+                                    Toggle("Enable band", isOn: $band.enabled).labelsHidden().frame(width: 20)
+                                    CompactPicker(selection: $band.type, options: EQFilterType.allCases.map { ($0, $0.title) }, accessibilityLabel: "Type")
+                                        .frame(width: BridgeEQLayout.typeWidth, height: BridgeEQLayout.rowHeight)
+                                    LabeledNumber(label: "Frequency", value: $band.frequency, range: 10...24000, suffix: "Hz", showsLabel: false)
+                                        .frame(width: BridgeEQLayout.numberWidth, alignment: .leading)
+                                    LabeledNumber(label: "Gain", value: $band.gain, range: -24...24, suffix: "dB", showsLabel: false)
+                                        .frame(width: BridgeEQLayout.numberWidth, alignment: .leading)
+                                    LabeledNumber(label: "Q", value: $band.q, range: 0.1...20, suffix: "", showsLabel: false)
+                                        .frame(width: BridgeEQLayout.numberWidth, alignment: .leading)
+                                    Button(role: .destructive) { model.deleteBand(band.id) } label: {
+                                        Image(systemName: "trash").frame(width: 24, height: 24)
+                                    }
+                                    .buttonStyle(.plain).foregroundStyle(.secondary).help("Delete band").accessibilityLabel("Delete band")
+                                }
+                            }
+                        }
+                        .padding(.top, BridgeEQLayout.detailGap)
+                    }
+                    .scrollIndicators(.visible)
+                    .frame(minHeight: BridgeEQLayout.rowHeight + BridgeEQLayout.gap,
+                           idealHeight: bandListHeight,
+                           maxHeight: .infinity)
+                    .background(bandViewportMeasurement)
                 }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6).padding(.vertical, 5)
+                .padding(.horizontal, BridgeEQLayout.sectionInset)
+            }
         } label: {
-            HStack {
-                Text("EQ bands")
+            HStack(spacing: BridgeEQLayout.gap) {
+                Text("EQ bands").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Button("EQ curve", systemImage: "chart.xyaxis.line") { openWindow(id: "eq-curve") }.controlSize(.small)
                 Button("Add band", systemImage: "plus") { model.addBand() }.controlSize(.small)
@@ -110,22 +174,119 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
+    private var bandListHeight: CGFloat {
+        if model.preset.bands.isEmpty { return BridgeEQLayout.rowHeight }
+        return max(BridgeEQLayout.rowHeight + BridgeEQLayout.gap,
+                   CGFloat(min(model.preset.bands.count, BridgeEQLayout.automaticBandLimit))
+                   * (BridgeEQLayout.rowHeight + BridgeEQLayout.gap) - BridgeEQLayout.detailGap)
+    }
+
+    private var bandViewportMeasurement: some View {
+        GeometryReader { geometry in
+            Color.clear.preference(key: WindowLayoutMetricsKey.self,
+                                   value: WindowLayoutMetrics(listHeight: geometry.size.height))
+        }
+    }
+
+    private func bandColumns<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: BridgeEQLayout.gap, content: content)
+            .frame(width: BridgeEQLayout.tableWidth, alignment: .leading)
+    }
+
+    private var savedPreset: EQPreset? {
+        model.presets.first { $0.id == model.preset.id }
+    }
+
+    private var presetSelection: Binding<UUID?> {
+        Binding(get: { savedPreset?.id }, set: { id in
+            if let preset = model.presets.first(where: { $0.id == id }) { model.load(preset) }
+        })
+    }
+
     private var presets: some View {
-        GroupBox("Presets") {
-            HStack {
-                TextField("Preset name", text: $presetName).frame(width: 180)
-                Button("Save") { model.savePreset(named: presetName); presetName = "" }
-                Menu("Load") { ForEach(model.presets) { p in Button(p.name) { model.load(p) } } }
-                Menu("Delete") {
+        HStack(spacing: BridgeEQLayout.gap) {
+            Text("Preset").fixedSize()
+            CompactPicker(selection: presetSelection,
+                          options: (savedPreset == nil ? [(nil, "Current settings")] : [])
+                            + model.presets.map { (Optional($0.id), $0.name) },
+                          accessibilityLabel: "Preset")
+                .frame(maxWidth: .infinity).frame(height: BridgeEQLayout.rowHeight)
+                .disabled(model.presets.isEmpty)
+                .help(savedPreset?.name ?? "Current unsaved settings")
+            Button("Save") {
+                if let savedPreset { model.savePreset(named: savedPreset.name) }
+                else { beginSaveAs() }
+            }
+            Menu {
+                Button("Save As…") { beginSaveAs() }
+                Menu("Delete preset") {
                     ForEach(model.presets) { preset in
                         Button(preset.name, role: .destructive) { presetToDelete = preset }
                     }
-                }
-                .disabled(model.presets.isEmpty)
-                Spacer()
+                }.disabled(model.presets.isEmpty)
+                Divider()
                 Button("Import APO / AutoEQ…") { importing = true }
                 Button("Export…") { exporting = true }
-            }.padding(.horizontal, 6).padding(.vertical, 5)
+            } label: { Image(systemName: "ellipsis") }
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .help("Preset actions").accessibilityLabel("Preset actions")
+        }
+    }
+
+    private func beginSaveAs() {
+        presetName = model.preset.name == "Flat" ? "" : model.preset.name
+        namingPreset = true
+    }
+
+    private func saveNamedPreset() {
+        model.savePreset(named: presetName.trimmingCharacters(in: .whitespacesAndNewlines))
+        namingPreset = false
+    }
+
+    private var presetNamingSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Save preset").font(.headline)
+            TextField("Preset name", text: $presetName)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Preset name")
+                .focused($presetNameFocused)
+            HStack(spacing: BridgeEQLayout.gap) {
+                Spacer()
+                Button("Cancel") { namingPreset = false }.keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    let name = presetName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if model.presets.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+                        confirmingReplace = true
+                    } else { saveNamedPreset() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20).frame(width: 340)
+        .onAppear { presetNameFocused = true }
+        .alert("Replace existing preset?", isPresented: $confirmingReplace) {
+            Button("Cancel", role: .cancel) { }
+            Button("Replace", role: .destructive) { saveNamedPreset() }
+        } message: {
+            Text("A preset named “\(presetName.trimmingCharacters(in: .whitespacesAndNewlines))” already exists.")
+        }
+    }
+
+}
+
+private struct UtilitySection<Content: View, Heading: View>: View {
+    let content: Content
+    let heading: Heading
+    init(@ViewBuilder content: () -> Content, @ViewBuilder label: () -> Heading) {
+        self.content = content()
+        self.heading = label()
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: BridgeEQLayout.gap) {
+            heading
+            content
         }
     }
 }
@@ -135,17 +296,15 @@ private struct RouterHeader: View {
     let toggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("BridgeEQ").font(.title2.bold())
-                Text(router.status).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            }.fixedSize(horizontal: true, vertical: false)
-            Spacer()
+        HStack(spacing: BridgeEQLayout.gap) {
+            Text(router.recovering ? "Reconnecting…" : router.running ? "Processing" : "Stopped")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+                .help(router.status).lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
             MeterDisplay(meters: router.meters)
-                .frame(width: 282, height: 38)
-                .fixedSize()
+                .frame(width: 282, height: 38).fixedSize()
             Button(router.running || router.recovering ? "Stop" : "Start", action: toggle)
-                .buttonStyle(.borderedProminent).tint(router.running || router.recovering ? .red : .accentColor)
+                .buttonStyle(.bordered)
         }
     }
 }
@@ -173,6 +332,7 @@ private struct MeterDisplay: NSViewRepresentable {
 
 private struct LabeledNumber: View {
     let label: String; @Binding var value: Double; let range: ClosedRange<Double>; let suffix: String
+    var showsLabel = true
     private static let decimalFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -184,12 +344,63 @@ private struct LabeledNumber: View {
     }()
 
     var body: some View {
-        HStack(spacing: 5) {
-            Text(label).foregroundStyle(.secondary)
+        HStack(spacing: BridgeEQLayout.detailGap) {
+            if showsLabel { Text(label).foregroundStyle(.secondary) }
             TextField(label, value: $value, formatter: Self.decimalFormatter)
-                .frame(width: 70)
+                .frame(width: BridgeEQLayout.numberWidth)
                 .textFieldStyle(.roundedBorder)
-            Text(suffix).foregroundStyle(.secondary)
+                .monospacedDigit()
+                .multilineTextAlignment(.trailing)
+            if showsLabel && !suffix.isEmpty { Text(suffix).foregroundStyle(.secondary) }
+        }
+        .fixedSize()
+    }
+}
+
+// Explicit native popup geometry keeps menu edges aligned with column headings.
+private struct CompactPicker<Value: Hashable>: NSViewRepresentable {
+    @Binding var selection: Value
+    @Environment(\.isEnabled) private var isEnabled
+    let options: [(Value, String)]
+    let accessibilityLabel: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.controlSize = .regular
+        button.cell?.lineBreakMode = .byTruncatingTail
+        button.cell?.usesSingleLineMode = true
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        button.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.select(_:))
+        button.setAccessibilityLabel(accessibilityLabel)
+        return button
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSPopUpButton, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? nsView.intrinsicContentSize.width,
+               height: proposal.height ?? BridgeEQLayout.rowHeight)
+    }
+
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        context.coordinator.parent = self
+        if button.itemTitles != options.map({ $0.1 }) {
+            button.removeAllItems()
+            button.addItems(withTitles: options.map { $0.1 })
+        }
+        if let index = options.firstIndex(where: { $0.0 == selection }) { button.selectItem(at: index) }
+        button.isEnabled = isEnabled && !options.isEmpty
+    }
+
+    final class Coordinator: NSObject {
+        var parent: CompactPicker
+        init(_ parent: CompactPicker) { self.parent = parent }
+        @objc func select(_ sender: NSPopUpButton) {
+            let index = sender.indexOfSelectedItem
+            guard parent.options.indices.contains(index) else { return }
+            parent.selection = parent.options[index].0
         }
     }
 }
@@ -304,4 +515,99 @@ struct TextDocument: FileDocument {
     init(text: String) { self.text = text }
     init(configuration: ReadConfiguration) throws { text = configuration.file.regularFileContents.flatMap { String(data: $0, encoding: .utf8) } ?? "" }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { .init(regularFileWithContents: Data(text.utf8)) }
+}
+
+// Measure the fixed chrome separately from the flexible band viewport.
+private struct WindowLayoutMetrics: Equatable {
+    var contentHeight: CGFloat?
+    var listHeight: CGFloat?
+}
+
+private struct WindowLayoutMetricsKey: PreferenceKey {
+    static var defaultValue = WindowLayoutMetrics()
+    static func reduce(value: inout WindowLayoutMetrics, nextValue: () -> WindowLayoutMetrics) {
+        let next = nextValue()
+        value.contentHeight = next.contentHeight ?? value.contentHeight
+        value.listHeight = next.listHeight ?? value.listHeight
+    }
+}
+
+// SwiftUI updates its minimum size when rows disappear, but does not grow the
+// native window when rows are added. Apply a bounded ideal height in both cases.
+private struct BandWindowSizing: NSViewRepresentable {
+    let bandCount: Int
+    let contentHeight: CGFloat
+    let hasMeasurements: Bool
+
+    func makeNSView(context: Context) -> SizingView { SizingView() }
+    func updateNSView(_ view: SizingView, context: Context) {
+        view.bandCount = bandCount
+        view.targetHeight = contentHeight
+        view.hasMeasurements = hasMeasurements
+        view.scheduleResize()
+    }
+
+    final class SizingView: NSView {
+        var bandCount = 0
+        var targetHeight: CGFloat = 0
+        var hasMeasurements = false
+        private var appliedCount: Int?
+        private var userSized = false
+        private var startingHeight: CGFloat = 0
+        private var pending = false
+        private var applyingResize = false
+        private var observers: [NSObjectProtocol] = []
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            guard let window else { return }
+            appliedCount = nil
+            userSized = false
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willStartLiveResizeNotification, object: window, queue: .main) { [weak self, weak window] _ in
+                self?.startingHeight = window?.frame.height ?? 0
+            })
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: window, queue: .main) { [weak self, weak window] _ in
+                guard let self, let window else { return }
+                if abs(window.frame.height - self.startingHeight) > 1 { self.userSized = true }
+            })
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self, weak window] _ in
+                guard let self, let window, self.hasMeasurements,
+                      self.appliedCount == self.bandCount,
+                      !self.applyingResize, !window.inLiveResize else { return }
+                // Also respect enlargement through the native Zoom action.
+                self.userSized = true
+            })
+            scheduleResize()
+        }
+
+        deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+
+        func scheduleResize() {
+            guard !pending else { return }
+            pending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.pending = false
+                guard let window = self.window, self.hasMeasurements,
+                      self.appliedCount != self.bandCount else { return }
+                self.appliedCount = self.bandCount
+                // Respect a height explicitly chosen by the user for this window.
+                guard !self.userSized, !window.inLiveResize else { return }
+                // SwiftUI geometry excludes the title-bar safe area even when
+                // AppKit uses a full-size content view. Include that chrome.
+                let titleHeight = window.frame.height - window.contentLayoutRect.height
+                var frame = window.frame
+                frame.size.height = max(300, self.targetHeight) + titleHeight
+                frame.size.height = min(frame.height, window.screen?.visibleFrame.height ?? frame.height)
+                frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+                if abs(window.frame.height - frame.height) > 1 {
+                    self.applyingResize = true
+                    window.setFrame(frame, display: true)
+                    self.applyingResize = false
+                }
+            }
+        }
+    }
 }
