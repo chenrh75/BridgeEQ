@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 import CoreText
+import QuartzCore
 
 enum BridgeEQLayout {
     static let gap: CGFloat = 8
@@ -327,6 +328,7 @@ private struct MeterDisplay: NSViewRepresentable {
 
     static func dismantleNSView(_ view: MeterView, coordinator: ()) {
         view.model?.onUpdate = nil
+        view.model = nil
     }
 }
 
@@ -406,38 +408,228 @@ private struct CompactPicker<Value: Hashable>: NSViewRepresentable {
 }
 
 private final class MeterView: NSView {
-    weak var model: MeterModel?
-    var state = MeterState() { didSet { needsDisplay = true } }
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureMeterLayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureMeterLayers()
+    }
+
+    // Retain the opaque hold markers above the changing bar artwork. Their
+    // backing is reused by the compositor until their positions change.
+    private let holdLayers = (0..<4).map { _ in CALayer() }
+    private let trackLayers = (0..<4).map { _ in CALayer() }
+    private let fillLayers = (0..<4).map { _ in CALayer() }
+    private let staticLabelsLayer = CAShapeLayer()
+    private func configureMeterLayers() {
+        wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let labels = CGMutablePath()
+        for (text, x, y, font) in [("IN", 0.0, 25.0, Self.labelMeterFont),
+                                    ("OUT", 143.0, 25.0, Self.labelMeterFont),
+                                    ("L", 0.0, 14.0, Self.valueMeterFont),
+                                    ("R", 0.0, 2.0, Self.valueMeterFont),
+                                    ("L", 143.0, 14.0, Self.valueMeterFont),
+                                    ("R", 143.0, 2.0, Self.valueMeterFont)] {
+            labels.addPath(font.path(for: text), transform: CGAffineTransform(translationX: x, y: y))
+        }
+        staticLabelsLayer.path = labels
+        staticLabelsLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        staticLabelsLayer.frame = NSRect(x: 0, y: 0, width: 282, height: 38)
+        layer?.addSublayer(staticLabelsLayer)
+        for index in holdLayers.indices {
+            let bar = barRect(index)
+            let track = trackLayers[index]
+            track.frame = bar
+            track.cornerRadius = bar.height / 2
+            layer?.addSublayer(track)
+            let fill = fillLayers[index]
+            fill.anchorPoint = .zero
+            fill.position = bar.origin
+            fill.bounds = NSRect(x: 0, y: 0, width: channels[index].width, height: bar.height)
+            fill.cornerRadius = min(bar.height, channels[index].width) / 2
+            layer?.addSublayer(fill)
+            let marker = holdLayers[index]
+            marker.backgroundColor = NSColor.white.cgColor
+            marker.frame = holdRect(index, channel: channels[index])
+            layer?.addSublayer(marker)
+        }
+        CATransaction.commit()
+        updateMeterColors()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateMeterColors()
+    }
+
+    private func updateMeterColors() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            staticLabelsLayer.fillColor = NSColor.secondaryLabelColor.cgColor
+            for index in trackLayers.indices {
+                trackLayers[index].backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.18).cgColor
+                fillLayers[index].backgroundColor = (channels[index].clipped ? NSColor.systemRed : NSColor.systemGreen).cgColor
+            }
+        }
+        CATransaction.commit()
+    }
+
+    private var visibilityObservers = [NSObjectProtocol]()
+    weak var model: MeterModel? {
+        didSet {
+            if oldValue !== model { oldValue?.setDisplayVisible(self, false) }
+            updateMeterVisibility()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let center = NotificationCenter.default
+        visibilityObservers.forEach { center.removeObserver($0) }
+        visibilityObservers.removeAll()
+        if let window {
+            for name in [NSWindow.didChangeOcclusionStateNotification,
+                         NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification] {
+                visibilityObservers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.updateMeterVisibility() }
+                })
+            }
+            visibilityObservers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.model?.setDisplayVisible(self, false)
+                }
+            })
+        }
+        updateMeterVisibility()
+    }
+
+    override func viewDidHide() { super.viewDidHide(); updateMeterVisibility() }
+    override func viewDidUnhide() { super.viewDidUnhide(); updateMeterVisibility() }
+
+    private func updateMeterVisibility() {
+        let visible = window.map { $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible) } ?? false
+        model?.setDisplayVisible(self, visible && !isHiddenOrHasHiddenAncestor)
+    }
+
+    deinit { visibilityObservers.forEach { NotificationCenter.default.removeObserver($0) } }
+    var state = MeterState() {
+        didSet {
+            guard state != oldValue || numericUpdatePending else { return }
+            updateChannels(at: ProcessInfo.processInfo.systemUptime)
+        }
+    }
+
+    private var lastNumericUpdate: TimeInterval?
+    private var numericUpdatePending = false
+    private func updateChannels(at now: TimeInterval) {
+        let reset = state == MeterState()
+        let refreshNumbers = reset || (lastNumericUpdate.map { now - $0 >= 0.1 - 0.000001 } ?? true)
+        numericUpdatePending = !refreshNumbers
+        if refreshNumbers { lastNumericUpdate = now }
+        let next = renderedChannels(refreshNumbers: refreshNumbers)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for index in next.indices {
+            let previous = channels[index]
+            let current = next[index]
+            if current.width != previous.width {
+                fillLayers[index].bounds.size.width = current.width
+                let radius = min(barRect(index).height, current.width) / 2
+                if fillLayers[index].cornerRadius != radius {
+                    fillLayers[index].cornerRadius = radius
+                }
+            }
+            if current.clipped != previous.clipped {
+                effectiveAppearance.performAsCurrentDrawingAppearance {
+                    fillLayers[index].backgroundColor = (current.clipped ? NSColor.systemRed : NSColor.systemGreen).cgColor
+                }
+            }
+            if current.holdX != previous.holdX {
+                holdLayers[index].frame = holdRect(index, channel: current)
+            }
+            if current.text != previous.text || current.clipped != previous.clipped {
+                setNeedsDisplay(numberRect(index))
+            }
+        }
+        CATransaction.commit()
+        channels = next
+    }
+
+    // The audio model retains full precision. Bar changes update retained
+    // rectangles; only numeric changes invalidate the view's drawing.
+    // Bars follow every model update; numeric labels refresh at most 10 Hz.
+    // Clip transitions and a full reset bypass the numeric throttle.
+    private struct Channel: Equatable {
+        var width: CGFloat = 0
+        var holdX: CGFloat = 0
+        var text = "-60"
+        var clipped = false
+    }
+    private var channels = [Channel](repeating: Channel(), count: 4)
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        staticLabelsLayer.contentsScale = window?.backingScaleFactor ?? 2
+        CATransaction.commit()
+        updateChannels(at: ProcessInfo.processInfo.systemUptime)
+        needsDisplay = true
+    }
+
+    private func renderedChannels(refreshNumbers: Bool) -> [Channel] {
+        let scale = window?.backingScaleFactor ?? 2
+        func channel(_ index: Int, _ value: Float, _ hold: Float, _ clipped: Bool) -> Channel {
+            let refresh = refreshNumbers || clipped != channels[index].clipped
+            let text = refresh ? (clipped ? "CLIP" : String(format: "%3.0f", 20 * log10(max(Double(value), 0.001)))) : channels[index].text
+            return Channel(width: (92 * position(value) * scale).rounded() / scale,
+                    holdX: (min(90, max(0, 92 * position(hold) - 1)) * scale).rounded() / scale,
+                    text: text,
+                    clipped: clipped)
+        }
+        return [channel(0, state.inputLeft, state.inputLeftHold, state.inputLeftClips),
+                channel(1, state.inputRight, state.inputRightHold, state.inputRightClips),
+                channel(2, state.outputLeft, state.outputLeftHold, state.outputLeftClips),
+                channel(3, state.outputRight, state.outputRightHold, state.outputRightClips)]
+    }
+
+    private func channelRect(_ index: Int) -> NSRect {
+        NSRect(x: index < 2 ? 0 : 143, y: index.isMultiple(of: 2) ? 13 : 1, width: 139, height: 12)
+    }
+
+    private func barRect(_ index: Int) -> NSRect {
+        NSRect(x: (index < 2 ? 0 : 143) + 13, y: index.isMultiple(of: 2) ? 14 : 2, width: 92, height: 7)
+    }
+
+    private func numberRect(_ index: Int) -> NSRect {
+        NSRect(x: (index < 2 ? 0 : 143) + 109, y: index.isMultiple(of: 2) ? 13 : 1, width: 30, height: 12)
+    }
+
+    private func holdRect(_ index: Int, channel: Channel) -> NSRect {
+        let bar = barRect(index)
+        return NSRect(x: bar.minX + channel.holdX, y: bar.minY, width: 2, height: bar.height)
+    }
 
     override var intrinsicContentSize: NSSize { NSSize(width: 282, height: 38) }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        drawStereo(label: "IN", x: 0, values: (state.inputLeft, state.inputRight),
-                   holds: (state.inputLeftHold, state.inputRightHold), clips: (state.inputLeftClips, state.inputRightClips))
-        drawStereo(label: "OUT", x: 143, values: (state.outputLeft, state.outputRight),
-                   holds: (state.outputLeftHold, state.outputRightHold), clips: (state.outputLeftClips, state.outputRightClips))
-    }
-
-    private func drawStereo(label: String, x: CGFloat, values: (Float, Float), holds: (Float, Float), clips: (Bool, Bool)) {
-        drawText(label, at: CGPoint(x: x, y: 25), color: .secondaryLabelColor, size: 10)
-        drawChannel("L", value: values.0, hold: holds.0, clipped: clips.0, x: x, y: 14)
-        drawChannel("R", value: values.1, hold: holds.1, clipped: clips.1, x: x, y: 2)
-    }
-
-    private func drawChannel(_ channel: String, value: Float, hold: Float, clipped: Bool, x: CGFloat, y: CGFloat) {
-        drawText(channel, at: CGPoint(x: x, y: y), color: .secondaryLabelColor, size: 9)
-        let bar = NSRect(x: x + 13, y: y, width: 92, height: 7)
-        NSColor.secondaryLabelColor.withAlphaComponent(0.18).setFill()
-        NSBezierPath(roundedRect: bar, xRadius: 4, yRadius: 4).fill()
-        let width = bar.width * position(value)
-        if width > 0 {
-            (clipped ? NSColor.systemRed : NSColor.systemGreen).setFill()
-            NSBezierPath(roundedRect: NSRect(x: bar.minX, y: bar.minY, width: width, height: bar.height), xRadius: 4, yRadius: 4).fill()
+        for index in channels.indices where needsToDraw(channelRect(index)) {
+            drawChannel(index, channel: channels[index],
+                        x: index < 2 ? 0 : 143, y: index.isMultiple(of: 2) ? 14 : 2)
         }
-        NSColor.white.setFill()
-        NSRect(x: bar.minX + min(bar.width - 2, max(0, bar.width * position(hold) - 1)), y: y, width: 2, height: 7).fill()
-        let text = clipped ? "CLIP" : String(format: "%3.0f", 20 * log10(max(Double(value), 0.001)))
-        drawText(text, at: CGPoint(x: x + 109, y: y), color: clipped ? .systemRed : .secondaryLabelColor, size: 9)
+    }
+
+    private func drawChannel(_ index: Int, channel: Channel, x: CGFloat, y: CGFloat) {
+        if needsToDraw(numberRect(index)) {
+            drawText(channel.text, at: CGPoint(x: x + 109, y: y), color: channel.clipped ? .systemRed : .secondaryLabelColor, size: 9)
+        }
     }
 
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat) {
@@ -446,23 +638,10 @@ private final class MeterView: NSView {
         // the meter's continuously-redrawn path while retaining crisp text.
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         let font = size >= 10 ? Self.labelMeterFont : Self.valueMeterFont
-        var x = point.x
-
         context.saveGState()
+        context.translateBy(x: point.x, y: point.y)
         context.beginPath()
-        for character in text.uppercased() {
-            guard let glyph = font.glyphs[character] else {
-                x += font.fallbackAdvance
-                continue
-            }
-            if let path = glyph.path {
-                context.saveGState()
-                context.translateBy(x: x, y: point.y)
-                context.addPath(path)
-                context.restoreGState()
-            }
-            x += glyph.advance
-        }
+        context.addPath(font.path(for: text))
         context.setFillColor((color.usingColorSpace(.deviceRGB) ?? color).cgColor)
         context.fillPath()
         context.restoreGState()
@@ -476,6 +655,27 @@ private final class MeterView: NSView {
     private final class MeterFont {
         let glyphs: [Character: MeterGlyph]
         let fallbackAdvance: CGFloat
+        private var textPaths = [String: CGPath]()
+
+        func path(for text: String) -> CGPath {
+            if let cached = textPaths[text] { return cached }
+            let path = CGMutablePath()
+            var x: CGFloat = 0
+            for character in text {
+                guard let glyph = glyphs[character] else {
+                    x += fallbackAdvance
+                    continue
+                }
+                if let outline = glyph.path {
+                    path.addPath(outline, transform: CGAffineTransform(translationX: x, y: 0))
+                }
+                x += glyph.advance
+            }
+            // Numeric levels have a small practical vocabulary. Bound the
+            // cache even if unusual input contains extreme Float amplitudes.
+            if textPaths.count < 128 { textPaths[text] = path }
+            return path
+        }
 
         init(size: CGFloat) {
             let appKitFont = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)

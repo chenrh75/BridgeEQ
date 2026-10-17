@@ -1,5 +1,23 @@
+# macOS and Xcode user state
 .DS_Store
-DerivedData/
-build/
 xcuserdata/
 *.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Generated builds and diagnostics
+build/
+DerivedData/
+.build/
+.swiftpm/
+*.app/
+*.dSYM/
+*.log
+
+# Python benchmark caches
+__pycache__/
+*.py[cod]
+
+# Keep only the downloadable app archive in version control
+*.zip
+!BridgeEQ-Standalone.zip

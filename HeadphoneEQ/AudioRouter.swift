@@ -48,8 +48,10 @@ final class AudioRouter: ObservableObject {
     private var outputDeviceID: AudioDeviceID?
     private var outputDeviceListener: AudioObjectPropertyListenerBlock?
     private var lastDefaultOutputDeviceID: AudioDeviceID?
-    private let inputLevels = MeterAccumulator()
-    private let outputLevels = MeterAccumulator()
+    private let inputLevels = MeterAccumulator(enabled: false)
+    private let outputLevels = MeterAccumulator(enabled: false)
+    private var meterTapInstalled = false
+    private var meteringActive = false
     private var holdUntil = [TimeInterval](repeating: 0, count: 4)
     private var clipUntil = [TimeInterval](repeating: 0, count: 4)
     // The Float processing path has headroom above full scale. Only values that
@@ -60,6 +62,7 @@ final class AudioRouter: ObservableObject {
     var onRecoveryNeeded: (() -> Void)?
 
     init() {
+        meters.onVisibilityChange = { [weak self] in self?.updateMeteringActivity() }
         configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] notification in
             Task { @MainActor in
                 guard let self, let engine = notification.object as? AVAudioEngine,
@@ -135,7 +138,6 @@ final class AudioRouter: ObservableObject {
         outputEngine.connect(eq, to: mixer, format: processingFormat)
         outputEngine.connect(mixer, to: outputEngine.outputNode, format: nil)
         apply(preset, eq: eq, mixer: mixer)
-        installMeter(on: mixer, bus: 0, input: false)
         outputEngine.prepare()
         do {
             try outputEngine.start()
@@ -147,12 +149,10 @@ final class AudioRouter: ObservableObject {
                 // AVAudioEngine converts from its native rate to the output rate.
                 outputEngine.pause()
                 player.stop()
-                mixer.removeTap(onBus: 0)
                 outputEngine.disconnectNodeOutput(player)
                 outputEngine.disconnectNodeOutput(eq)
                 outputEngine.connect(player, to: eq, format: tap.format)
                 outputEngine.connect(eq, to: mixer, format: tap.format)
-                installMeter(on: mixer, bus: 0, input: false)
                 try outputEngine.start()
                 player.play()
             }
@@ -164,13 +164,12 @@ final class AudioRouter: ObservableObject {
             observeOutput(output.id)
             lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
             running = true; status = "System audio → \(output.name)"
-            startMeterTimer()
+            updateMeteringActivity()
         } catch {
             // A capture failure can happen after the output engine has started.
             // Tear down the partial route before allowing another start attempt.
             player.stop()
             outputEngine.stop()
-            mixer.removeTap(onBus: 0)
             throw error
         }
     }
@@ -205,9 +204,9 @@ final class AudioRouter: ObservableObject {
 
     func stop() {
         routeGeneration += 1
-        meterTimer?.invalidate(); meterTimer = nil
-        gainMixer?.removeTap(onBus: 0)
-        inputCapture?.stop(); player?.stop(); outputEngine?.stop()
+        setMeteringActive(false)
+        inputCapture?.stop()
+        player?.stop(); outputEngine?.stop()
         systemTap?.stop(); systemTap = nil
         if let id = outputDeviceID, let listener = outputDeviceListener {
             for selector in Self.outputSelectors {
@@ -262,10 +261,29 @@ final class AudioRouter: ObservableObject {
         mixer.outputVolume = pow(10, Float(preset.outputGain) / 20)
     }
 
-    private func installMeter(on node: AVAudioNode, bus: AVAudioNodeBus, input: Bool) {
-        let accumulator = input ? inputLevels : outputLevels
-        node.installTap(onBus: bus, bufferSize: 2048, format: nil) { buffer, _ in
-            accumulator.accumulate(measureLevels(buffer))
+    private func updateMeteringActivity() {
+        setMeteringActive(running && outputEngine?.isRunning == true && meters.hasVisibleDisplay)
+    }
+
+    private func setMeteringActive(_ enabled: Bool) {
+        guard enabled != meteringActive else { return }
+        meteringActive = enabled
+        meterTimer?.invalidate(); meterTimer = nil
+        inputLevels.setEnabled(enabled); outputLevels.setEnabled(enabled)
+        if enabled, let gainMixer {
+            holdUntil = [TimeInterval](repeating: 0, count: 4)
+            clipUntil = [TimeInterval](repeating: 0, count: 4)
+            meters.state = MeterState()
+            let accumulator = outputLevels
+            let generation = accumulator.generation
+            gainMixer.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
+                accumulator.measure(buffer, expectedGeneration: generation)
+            }
+            meterTapInstalled = true
+            startMeterTimer()
+        } else if meterTapInstalled {
+            gainMixer?.removeTap(onBus: 0)
+            meterTapInstalled = false
         }
     }
 
@@ -279,6 +297,7 @@ final class AudioRouter: ObservableObject {
     }
 
     private func updateMeters() {
+        guard meteringActive else { return }
         let input = inputLevels.drain()
         let output = outputLevels.drain()
         let previous = meters.state
@@ -297,7 +316,9 @@ final class AudioRouter: ObservableObject {
         updateMeterChannel(level: output.rightRMS, peak: output.rightPeak, reportsClip: true,
                            shown: &meter.outputRight, hold: &meter.outputRightHold,
                            holdUntil: &holdUntil[3], clipped: &meter.outputRightClips, clipUntil: &clipUntil[3], now: now)
-        if meter != previous { meters.state = meter }
+        // Deliver every visible tick so a throttled numeric label can catch up
+        // even after the audio settles at an unchanged level.
+        meters.state = meter
     }
 
     private func updateMeterChannel(level: Float, peak: Float, reportsClip: Bool,
@@ -323,27 +344,76 @@ final class AudioRouter: ObservableObject {
 @MainActor
 final class MeterModel {
     var onUpdate: ((MeterState) -> Void)?
+    var onVisibilityChange: (() -> Void)?
+    private var visibleDisplays = Set<ObjectIdentifier>()
+    var hasVisibleDisplay: Bool { !visibleDisplays.isEmpty }
+
+    func setDisplayVisible(_ display: AnyObject, _ visible: Bool) {
+        let previouslyVisible = hasVisibleDisplay
+        if visible { visibleDisplays.insert(ObjectIdentifier(display)) }
+        else { visibleDisplays.remove(ObjectIdentifier(display)) }
+        if hasVisibleDisplay != previouslyVisible { onVisibilityChange?() }
+    }
     var state = MeterState() {
         didSet { onUpdate?(state) }
     }
 }
 
 private final class MeterAccumulator: @unchecked Sendable {
-    private let levels = OSAllocatedUnfairLock(initialState: StereoMeterLevels())
+    private struct State {
+        var levels = StereoMeterLevels()
+        var enabled: Bool
+        var generation = 0
+    }
+    private let storage: OSAllocatedUnfairLock<State>
 
-    func accumulate(_ incoming: StereoMeterLevels) {
-        levels.withLock {
-            $0.leftPeak = max($0.leftPeak, incoming.leftPeak)
-            $0.rightPeak = max($0.rightPeak, incoming.rightPeak)
-            $0.leftRMS = max($0.leftRMS, incoming.leftRMS)
-            $0.rightRMS = max($0.rightRMS, incoming.rightRMS)
+    init(enabled: Bool = true) {
+        storage = OSAllocatedUnfairLock(initialState: State(enabled: enabled))
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        storage.withLock {
+            $0.enabled = enabled
+            $0.generation += 1
+            $0.levels = StereoMeterLevels()
         }
     }
 
+    var generation: Int { storage.withLock { $0.generation } }
+
+    func measure(_ buffer: AVAudioPCMBuffer, expectedGeneration: Int? = nil) {
+        let generation = storage.withLock { state -> Int? in
+            guard state.enabled, expectedGeneration == nil || expectedGeneration == state.generation else { return nil }
+            return state.generation
+        }
+        guard let generation else { return }
+        let incoming = measureLevels(buffer)
+        storage.withLock {
+            // A callback already in flight when the window hid must not
+            // republish old peaks after a subsequent resume.
+            guard $0.enabled, $0.generation == generation else { return }
+            Self.merge(incoming, into: &$0.levels)
+        }
+    }
+
+    func accumulate(_ incoming: StereoMeterLevels) {
+        storage.withLock {
+            guard $0.enabled else { return }
+            Self.merge(incoming, into: &$0.levels)
+        }
+    }
+
+    private static func merge(_ incoming: StereoMeterLevels, into levels: inout StereoMeterLevels) {
+        levels.leftPeak = max(levels.leftPeak, incoming.leftPeak)
+        levels.rightPeak = max(levels.rightPeak, incoming.rightPeak)
+        levels.leftRMS = max(levels.leftRMS, incoming.leftRMS)
+        levels.rightRMS = max(levels.rightRMS, incoming.rightRMS)
+    }
+
     func drain() -> StereoMeterLevels {
-        levels.withLock {
-            let result = $0
-            $0 = StereoMeterLevels()
+        storage.withLock {
+            let result = $0.levels
+            $0.levels = StereoMeterLevels()
             return result
         }
     }
@@ -425,12 +495,14 @@ private final class SystemAudioTap {
 private final class TapInputCapture: @unchecked Sendable {
     private let tap: SystemAudioTap
     private var ioProc: AudioDeviceIOProcID?
-    private weak var player: AVAudioPlayerNode?
+    private let player: AVAudioPlayerNode
+    private let interleaved: Bool
     private let levels: MeterAccumulator
     private let buffers = OSAllocatedUnfairLock(initialState: [AVAudioPCMBuffer]())
 
     init(tap: SystemAudioTap, player: AVAudioPlayerNode, levels: MeterAccumulator) throws {
         self.tap = tap; self.player = player; self.levels = levels
+        interleaved = tap.sourceFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         // Preallocate a bounded pool; avoid allocating PCM storage in the callback.
         buffers.withLock { pool in
             pool = (0..<16).compactMap { _ in AVAudioPCMBuffer(pcmFormat: tap.format, frameCapacity: 16384) }
@@ -458,16 +530,17 @@ private final class TapInputCapture: @unchecked Sendable {
     deinit { stop() }
 
     fileprivate func render(_ input: UnsafePointer<AudioBufferList>) -> OSStatus {
-        guard let player else { return noErr }
         let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-        let interleaved = tap.sourceFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         let requiredBuffers = interleaved ? 1 : 2
         guard source.count == requiredBuffers, let first = source.first,
               first.mNumberChannels == (interleaved ? 2 : 1),
               first.mData != nil, first.mDataByteSize > 0 else { return noErr }
         let bytesPerFrame = UInt32(MemoryLayout<Float>.size * (interleaved ? 2 : 1))
         let frames = first.mDataByteSize / bytesPerFrame
-        guard frames > 0, let buffer = acquireBuffer(for: frames), let destination = buffer.floatChannelData else { return noErr }
+        guard frames > 0 else { return noErr }
+        guard let buffer = acquireBuffer(for: frames), let destination = buffer.floatChannelData else {
+            return noErr
+        }
         buffer.frameLength = frames
         if interleaved {
             let samples = first.mData!.assumingMemoryBound(to: Float.self)
@@ -486,8 +559,14 @@ private final class TapInputCapture: @unchecked Sendable {
                 memcpy(destination[channel], data, Int(frames) * MemoryLayout<Float>.size)
             }
         }
-        levels.accumulate(measureLevels(buffer))
-        player.scheduleBuffer(buffer) { [weak self] in self?.release(buffer) }
+        levels.measure(buffer)
+        // The completion needs only the pool, not a weak load of the capture
+        // object on every audio callback. The pool remains alive until all
+        // queued completions finish, without retaining the player or capture.
+        player.scheduleBuffer(buffer) { [buffers] in
+            buffer.frameLength = 0
+            buffers.withLock { $0.append(buffer) }
+        }
         return noErr
     }
 
