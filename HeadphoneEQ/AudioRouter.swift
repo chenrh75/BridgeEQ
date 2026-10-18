@@ -36,6 +36,8 @@ final class AudioRouter: ObservableObject {
     @Published private(set) var status = "Stopped"
     let meters = MeterModel()
 
+    private var directPath: DirectAudioPath?
+    private var failedDirectOutputs = Set<String>()
     private var inputCapture: TapInputCapture?
     private var systemTap: SystemAudioTap?
     private var outputEngine: AVAudioEngine?
@@ -122,6 +124,15 @@ final class AudioRouter: ObservableObject {
             throw AudioDeviceError.invalidRoute("Choose a physical output: headphones, speakers, or a DAC.")
         }
         ignoreConfigurationChangesUntil = Date().addingTimeInterval(3)
+        if !failedDirectOutputs.contains(output.uid) {
+            do {
+                try startDirect(output: output, preset: preset)
+                return
+            } catch {
+                // Unsupported layouts/rates and unavailable direct devices keep
+                // the existing conversion and playback path.
+            }
+        }
         let outputEngine = AVAudioEngine()
         try selectOutputDevice(output.id, on: outputEngine.outputNode)
 
@@ -174,6 +185,48 @@ final class AudioRouter: ObservableObject {
         }
     }
 
+    private func startDirect(output: AudioDevice, preset: EQPreset) throws {
+        guard output.inputChannels == 0, output.outputChannels == 2 else {
+            throw AudioDeviceError.inputFormatUnavailable(output.name)
+        }
+        // A silent output client establishes our process object for exclusion
+        // from the global tap. Keep it alive until the real IOProc is registered.
+        var bootstrap: AudioDeviceIOProcID?
+        try check(AudioDeviceCreateIOProcID(output.id, directBootstrapIO, nil, &bootstrap), "Prepare output")
+        defer {
+            if let bootstrap {
+                AudioDeviceStop(output.id, bootstrap)
+                AudioDeviceDestroyIOProcID(output.id, bootstrap)
+            }
+        }
+        guard let bootstrap else { throw AudioDeviceError.inputFormatUnavailable(output.name) }
+        try check(AudioDeviceStart(output.id, bootstrap), "Prepare system audio exclusion")
+        let tap = try DirectSystemTap(output: output)
+        let eq = AVAudioUnitEQ(numberOfBands: max(preset.bands.count, 1))
+        apply(preset, eq: eq, mixer: nil)
+        let path = try DirectAudioPath(tap: tap, eq: eq)
+        path.setOutputGain(pow(10, Float(preset.outputGain) / 20), initial: true)
+        path.onInput = { [inputLevels] in inputLevels.measure($0) }
+        path.onOutput = { [outputLevels] in outputLevels.measure($0) }
+        let generation = routeGeneration
+        path.onFailure = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.routeGeneration == generation else { return }
+                self.failedDirectOutputs.insert(output.uid)
+                self.beginRecovery()
+                self.status = "Audio format changed; reconnecting…"
+                self.onRecoveryNeeded?()
+            }
+        }
+        try path.start()
+        directPath = path
+        self.eq = eq
+        observeOutput(output.id)
+        lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
+        running = true; status = "System audio → \(output.name)"
+        updateMeteringActivity()
+    }
+
     private static let outputSelectors: [AudioObjectPropertySelector] = [
         kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
         kAudioDevicePropertyStreamConfiguration
@@ -205,6 +258,7 @@ final class AudioRouter: ObservableObject {
     func stop() {
         routeGeneration += 1
         setMeteringActive(false)
+        directPath?.stop(); directPath = nil
         inputCapture?.stop()
         player?.stop(); outputEngine?.stop()
         systemTap?.stop(); systemTap = nil
@@ -225,7 +279,7 @@ final class AudioRouter: ObservableObject {
     }
 
     func update(_ preset: EQPreset) {
-        guard let eq, let gainMixer else { return }
+        guard let eq else { return }
         if eq.bands.count != max(preset.bands.count, 1) {
             // AVAudioUnitEQ cannot resize its bands in place. Rebuild when
             // adding/deleting bands or loading a preset with a different size.
@@ -234,10 +288,11 @@ final class AudioRouter: ObservableObject {
             return
         }
         apply(preset, eq: eq, mixer: gainMixer)
+        directPath?.setOutputGain(pow(10, Float(preset.outputGain) / 20))
     }
 
-    private func apply(_ preset: EQPreset, eq: AVAudioUnitEQ, mixer: AVAudioMixerNode) {
-        eq.globalGain = Float(preset.preamp)
+    private func apply(_ preset: EQPreset, eq: AVAudioUnitEQ, mixer: AVAudioMixerNode?) {
+        eq.globalGain = Float(mixer == nil && preset.globalBypass ? 0 : preset.preamp)
         let hasAudibleBand = preset.bands.contains { band in
             guard band.enabled else { return false }
             switch band.type {
@@ -245,7 +300,9 @@ final class AudioRouter: ObservableObject {
             case .parametric, .lowShelf, .highShelf: return abs(band.gain) > 0.0001
             }
         }
-        eq.bypass = preset.globalBypass || (!hasAudibleBand && abs(preset.preamp) <= 0.0001)
+        // Node bypass belongs to AVAudioEngine. A standalone unit bypasses
+        // individual bands and preamp instead.
+        eq.bypass = mixer != nil && (preset.globalBypass || (!hasAudibleBand && abs(preset.preamp) <= 0.0001))
         for (index, target) in eq.bands.enumerated() {
             guard index < preset.bands.count else { target.bypass = true; continue }
             let source = preset.bands[index]
@@ -256,13 +313,13 @@ final class AudioRouter: ObservableObject {
             let q = source.q.clamped(to: 0.1...20)
             target.bandwidth = Float(2 * asinh(1 / (2 * q)) / log(2))
             let isNeutralGainFilter = source.type != .lowPass && source.type != .highPass && abs(source.gain) <= 0.0001
-            target.bypass = !source.enabled || isNeutralGainFilter
+            target.bypass = (mixer == nil && preset.globalBypass) || !source.enabled || isNeutralGainFilter
         }
-        mixer.outputVolume = pow(10, Float(preset.outputGain) / 20)
+        mixer?.outputVolume = pow(10, Float(preset.outputGain) / 20)
     }
 
     private func updateMeteringActivity() {
-        setMeteringActive(running && outputEngine?.isRunning == true && meters.hasVisibleDisplay)
+        setMeteringActive(running && (directPath != nil || outputEngine?.isRunning == true) && meters.hasVisibleDisplay)
     }
 
     private func setMeteringActive(_ enabled: Bool) {
@@ -270,16 +327,18 @@ final class AudioRouter: ObservableObject {
         meteringActive = enabled
         meterTimer?.invalidate(); meterTimer = nil
         inputLevels.setEnabled(enabled); outputLevels.setEnabled(enabled)
-        if enabled, let gainMixer {
+        if enabled {
             holdUntil = [TimeInterval](repeating: 0, count: 4)
             clipUntil = [TimeInterval](repeating: 0, count: 4)
             meters.state = MeterState()
-            let accumulator = outputLevels
-            let generation = accumulator.generation
-            gainMixer.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
-                accumulator.measure(buffer, expectedGeneration: generation)
+            if let gainMixer {
+                let accumulator = outputLevels
+                let generation = accumulator.generation
+                gainMixer.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
+                    accumulator.measure(buffer, expectedGeneration: generation)
+                }
+                meterTapInstalled = true
             }
-            meterTapInstalled = true
             startMeterTimer()
         } else if meterTapInstalled {
             gainMixer?.removeTap(onBus: 0)
