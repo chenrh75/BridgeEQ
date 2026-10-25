@@ -18,6 +18,9 @@ DerivedData/
 __pycache__/
 *.py[cod]
 
+# Local regression checks
+/Tests/
+
 # Keep only the downloadable app archive in version control
 *.zip
 !BridgeEQ-Standalone.zip
