@@ -36,6 +36,18 @@ final class CoreAudioDevices {
         return device
     }
 
+    static func setDefaultOutputDeviceID(_ id: AudioDeviceID) throws {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var device = id
+        let result = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address,
+            0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &device)
+        guard result == noErr else { throw AudioDeviceError.osStatus(result, "Change system output") }
+        guard defaultOutputDeviceID() == id else {
+            throw AudioDeviceError.invalidRoute("macOS did not switch to the selected output. Try selecting it again.")
+        }
+    }
+
     static func nominalSampleRate(_ id: AudioDeviceID) throws -> Double {
         var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         var rate: Double = 0

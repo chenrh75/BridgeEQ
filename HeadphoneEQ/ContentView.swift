@@ -12,6 +12,8 @@ enum BridgeEQLayout {
     static let typeWidth: CGFloat = 130
     static let numberWidth: CGFloat = 92
     static let rowHeight: CGFloat = 28
+    static let actionLabelWidth: CGFloat = 52
+    static let actionLabelHeight: CGFloat = 18
     static let windowWidth: CGFloat = 522
     static let tableWidth: CGFloat = windowWidth - 2 * pageInset
     static let automaticBandLimit = 5
@@ -20,6 +22,8 @@ enum BridgeEQLayout {
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var launchAtLogin = LaunchAtLogin()
     @State private var presetName = ""
     @State private var importing = false
     @State private var exporting = false
@@ -31,17 +35,20 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            RouterHeader(router: model.router, toggle: model.toggle)
+            RouterHeader(router: model.router, processingRequested: model.processingRequested,
+                         noEQ: model.outputEQRule == .noEQ || (model.outputEQRule == .global && model.globalPreset == nil),
+                         toggle: model.toggle)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, BridgeEQLayout.pageInset)
                 .padding(.vertical, 2)
             Divider()
             VStack(alignment: .leading, spacing: BridgeEQLayout.pageInset) {
                 devices
-                controls
                 presets
+                controls
                 Divider()
                 bands
+                startupOption
             }
             .padding(.horizontal, BridgeEQLayout.pageInset)
             .padding(.top, BridgeEQLayout.pageInset)
@@ -63,6 +70,10 @@ struct ContentView: View {
                                      contentHeight: windowChromeHeight + bandListHeight,
                                      hasMeasurements: windowChromeHeight > 0))
         .sheet(isPresented: $namingPreset) { presetNamingSheet }
+        .onAppear { launchAtLogin.refresh() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { launchAtLogin.refresh() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.router.stop()
         }
@@ -90,15 +101,52 @@ struct ContentView: View {
         .fileExporter(isPresented: $exporting, document: TextDocument(text: model.exportText()), contentType: .plainText, defaultFilename: "\(model.preset.name).txt") { if case let .failure(error) = $0 { model.errorMessage = error.localizedDescription } }
     }
 
+    private var startupOption: some View {
+        HStack(spacing: BridgeEQLayout.gap) {
+            Toggle("Launch at login", isOn: Binding(
+                get: { launchAtLogin.enabled },
+                set: { enabled in
+                    do { try launchAtLogin.setEnabled(enabled) }
+                    catch { model.errorMessage = "Could not change launch at login: \(error.localizedDescription)" }
+                }
+            ))
+            .fixedSize()
+            .help("Open BridgeEQ automatically when you log in to your Mac.")
+            Spacer()
+            if launchAtLogin.needsApproval {
+                Text("Approval needed").foregroundStyle(.secondary)
+                Button("Open Settings…") { launchAtLogin.openSettings() }
+                    .controlSize(.small)
+            }
+        }
+        .font(.system(size: 12))
+    }
+
     private var devices: some View {
         HStack(spacing: BridgeEQLayout.gap) {
             Text("Output").fixedSize()
-            CompactPicker(selection: $model.outputUID, options: model.outputs.map { ($0.uid, $0.label) }, accessibilityLabel: "Output device")
+            CompactPicker(selection: Binding(get: { model.outputUID }, set: { model.selectOutput($0) }),
+                          options: model.outputs.map { ($0.uid, $0.label) }, accessibilityLabel: "Output device")
                 .frame(maxWidth: .infinity).frame(height: BridgeEQLayout.rowHeight)
                 .help(model.selectedOutput?.label ?? "Choose an output device")
-            Button { model.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
+            outputEQRule
+            Button { model.refreshDevices() } label: {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: BridgeEQLayout.actionLabelWidth, height: BridgeEQLayout.actionLabelHeight)
+            }
+                .buttonStyle(.bordered)
                 .help("Refresh devices").accessibilityLabel("Refresh devices")
         }
+    }
+
+    private var outputEQRule: some View {
+        CompactPicker(selection: Binding(
+            get: { model.outputEQRule },
+            set: { model.setOutputEQRule($0) }
+        ), options: OutputEQRule.allCases.map { ($0, $0.title) }, accessibilityLabel: "Output EQ rule")
+        .frame(width: 128, height: BridgeEQLayout.rowHeight)
+        .disabled(model.selectedOutput == nil)
+        .help("For \(model.selectedOutput?.name ?? "this output"): use the global preset, bind the selected preset, or play without EQ. No EQ overrides all presets.")
     }
 
     private var controls: some View {
@@ -199,8 +247,11 @@ struct ContentView: View {
     }
 
     private var presetSelection: Binding<UUID?> {
-        Binding(get: { savedPreset?.id }, set: { id in
-            if let preset = model.presets.first(where: { $0.id == id }) { model.load(preset) }
+        Binding(get: { model.outputEQRule == .global ? model.globalPreset?.id : savedPreset?.id }, set: { id in
+            if model.outputEQRule == .global {
+                if let preset = model.globalPresets.first(where: { $0.id == id }) { model.load(preset) }
+                else { model.setGlobalPreset(nil) }
+            } else if let preset = model.presets.first(where: { $0.id == id }) { model.load(preset) }
         })
     }
 
@@ -208,30 +259,38 @@ struct ContentView: View {
         HStack(spacing: BridgeEQLayout.gap) {
             Text("Preset").fixedSize()
             CompactPicker(selection: presetSelection,
-                          options: (savedPreset == nil ? [(nil, "Current settings")] : [])
-                            + model.presets.map { (Optional($0.id), $0.name) },
+                          options: model.outputEQRule == .global
+                            ? [(nil, "No EQ")] + model.globalPresets.map { (Optional($0.id), $0.name) }
+                            : (savedPreset == nil ? [(nil, "Current settings")] : [])
+                                + model.presets.map { (Optional($0.id), $0.name) },
                           accessibilityLabel: "Preset")
                 .frame(maxWidth: .infinity).frame(height: BridgeEQLayout.rowHeight)
-                .disabled(model.presets.isEmpty)
-                .help(savedPreset?.name ?? "Current unsaved settings")
-            Button("Save") {
-                if let savedPreset { model.savePreset(named: savedPreset.name) }
-                else { beginSaveAs() }
-            }
-            Menu {
+                .disabled(model.outputEQRule != .global && model.presets.isEmpty)
+                .help(model.outputEQRule == .global
+                      ? "Global fallback: \(model.globalPreset?.name ?? "No EQ")"
+                      : savedPreset?.name ?? "Current unsaved settings")
+            Menu("Save…") {
+                Button("Save") {
+                    if let savedPreset { model.savePreset(named: savedPreset.name) }
+                    else { beginSaveAs() }
+                }
                 Button("Save As…") { beginSaveAs() }
-                Menu("Delete preset") {
-                    ForEach(model.presets) { preset in
-                        Button(preset.name, role: .destructive) { presetToDelete = preset }
-                    }
-                }.disabled(model.presets.isEmpty)
                 Divider()
-                Button("Import APO / AutoEQ…") { importing = true }
+                Menu("Global fallback") {
+                    Button(model.globalPreset == nil ? "✓ No EQ" : "No EQ") { model.setGlobalPreset(nil) }
+                    ForEach(model.globalPresets) { preset in
+                        Button((model.globalPreset?.id == preset.id ? "✓ " : "") + preset.name) { model.setGlobalPreset(preset) }
+                    }
+                }
+                Divider()
+                Button("Import…") { importing = true }
                 Button("Export…") { exporting = true }
-            } label: { Image(systemName: "ellipsis") }
+                Button("Delete…", role: .destructive) { presetToDelete = savedPreset }
+                    .disabled(savedPreset == nil)
+            }
             .menuStyle(.borderedButton)
             .fixedSize()
-            .help("Preset actions").accessibilityLabel("Preset actions")
+            .accessibilityLabel("Save and preset actions")
         }
     }
 
@@ -294,17 +353,22 @@ private struct UtilitySection<Content: View, Heading: View>: View {
 
 private struct RouterHeader: View {
     @ObservedObject var router: AudioRouter
+    let processingRequested: Bool
+    let noEQ: Bool
     let toggle: () -> Void
 
     var body: some View {
         HStack(spacing: BridgeEQLayout.gap) {
-            Text(router.recovering ? "Reconnecting…" : router.running ? "Processing" : "Stopped")
+            Text(noEQ ? "No EQ" : router.recovering ? "Reconnecting…" : router.running ? "Processing" : processingRequested ? "No preset" : "Stopped")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
-                .help(router.status).lineLimit(1)
+                .help(noEQ ? "Audio plays without EQ on this output." : router.status).lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
             MeterDisplay(meters: router.meters)
                 .frame(width: 282, height: 38).fixedSize()
-            Button(router.running || router.recovering ? "Stop" : "Start", action: toggle)
+            Button(action: toggle) {
+                Text(processingRequested || router.running || router.recovering ? "Stop" : "Start")
+                    .frame(width: BridgeEQLayout.actionLabelWidth, height: BridgeEQLayout.actionLabelHeight)
+            }
                 .buttonStyle(.bordered)
         }
     }
@@ -402,7 +466,9 @@ private struct CompactPicker<Value: Hashable>: NSViewRepresentable {
         @objc func select(_ sender: NSPopUpButton) {
             let index = sender.indexOfSelectedItem
             guard parent.options.indices.contains(index) else { return }
-            parent.selection = parent.options[index].0
+            let value = parent.options[index].0
+            guard value != parent.selection else { return }
+            parent.selection = value
         }
     }
 }
@@ -496,13 +562,18 @@ private final class MeterView: NSView {
         if let window {
             for name in [NSWindow.didChangeOcclusionStateNotification,
                          NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification] {
-                visibilityObservers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.updateMeterVisibility() }
+                visibilityObservers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self, weak window] _ in
+                    // Enter through the main queue instead of checking the Swift
+                    // executor inherited from an AppKit notification callback.
+                    DispatchQueue.main.async { [weak self, weak window] in
+                        guard let self, let window, self.window === window else { return }
+                        self.updateMeterVisibility()
+                    }
                 })
             }
-            visibilityObservers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
+            visibilityObservers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self, weak window] _ in
+                DispatchQueue.main.async { [weak self, weak window] in
+                    guard let self, let window, self.window === window else { return }
                     self.model?.setDisplayVisible(self, false)
                 }
             })

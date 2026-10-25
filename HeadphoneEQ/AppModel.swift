@@ -6,24 +6,59 @@ import UniformTypeIdentifiers
 final class AppModel: ObservableObject {
     @Published var devices: [AudioDevice] = []
     @Published var outputUID = "" { didSet {
+        if !restoringState, outputUID != oldValue {
+            outputChanged()
+        }
         saveState()
-        if outputUID != oldValue, router.running || router.recovering { scheduleRecovery() }
     } }
-    @Published var preset: EQPreset = .flat { didSet { router.update(preset); saveState() } }
+    @Published var preset: EQPreset = .flat { didSet {
+        guard !restoringState else { return }
+        if devicePresets[outputUID]?.id == preset.id { devicePresets[outputUID] = preset }
+        if globalPreset?.id == preset.id, presetIsGlobal { globalPreset = preset }
+        router.update(preset)
+        saveState()
+    } }
     @Published var presets: [EQPreset] = []
+    @Published private(set) var devicePresets: [String: EQPreset] = [:]
+    @Published private(set) var outputRules: [String: OutputEQRule] = [:]
+    @Published private(set) var processingRequested = false
     @Published var errorMessage: String?
     let router = AudioRouter()
     private var retryTask: Task<Void, Never>?
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private var restoringState = true
+    @Published private(set) var globalPreset: EQPreset?
+    var globalPresets: [EQPreset] {
+        var choices = presets.filter { isGlobal($0) }
+        if let globalPreset, !choices.contains(where: { $0.id == globalPreset.id }) { choices.append(globalPreset) }
+        return choices
+    }
 
     var outputs: [AudioDevice] { devices.filter { $0.outputChannels > 0 && CoreAudioDevices.isPhysicalOutput($0.id) } }
     var selectedOutput: AudioDevice? { devices.first { $0.uid == outputUID } }
+    var outputEQRule: OutputEQRule {
+        let rule = outputRules[outputUID] ?? (devicePresets[outputUID] == nil ? .global : .preset)
+        return rule == .preset && devicePresets[outputUID] == nil ? .global : rule
+    }
+    var presetIsBoundToOutput: Bool { outputEQRule == .preset && devicePresets[outputUID]?.id == preset.id }
+    private var presetIsGlobal: Bool { isGlobal(preset) }
+    private func isGlobal(_ item: EQPreset) -> Bool {
+        !devicePresets.values.contains { $0.id == item.id }
+    }
+    private var presetIsBoundElsewhere: Bool {
+        !presetIsBoundToOutput && devicePresets.values.contains { $0.id == preset.id }
+    }
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         loadState()
+        devices = CoreAudioDevices.all()
+        if let systemOutput = outputs.first(where: { $0.id == CoreAudioDevices.defaultOutputDeviceID() }) {
+            outputUID = systemOutput.uid
+        }
         restoringState = false
         refreshDevices()
+        outputChanged()
         router.onRecoveryNeeded = { [weak self] in self?.scheduleRecovery() }
         router.onSystemOutputChanged = { [weak self] id in
             guard let self else { return }
@@ -31,15 +66,10 @@ final class AppModel: ObservableObject {
             // become the system default before it appears in our picker.
             self.devices = CoreAudioDevices.all()
             if let output = self.outputs.first(where: { $0.id == id }) {
-                if self.outputUID != output.uid {
-                    self.outputUID = output.uid // Also replaces any pending retry.
-                } else {
-                    self.scheduleRecovery()
-                }
+                if self.outputUID == output.uid { self.outputChanged() }
+                else { self.outputUID = output.uid }
             } else {
-                // Virtual system destinations still require a fresh capture
-                // tap, while playback keeps the selected physical output.
-                self.scheduleRecovery()
+                self.stopProcessing()
             }
         }
         if ProcessInfo.processInfo.arguments.contains("--smoke-test-route") {
@@ -86,35 +116,186 @@ final class AppModel: ObservableObject {
     }
 
     func toggle() {
-        if router.running || router.recovering { retryTask?.cancel(); router.stop(); return }
+        if processingRequested || router.running || router.recovering { stopProcessing(); return }
+        // Start follows macOS. It must not undo a Control Center selection
+        // just because its notification has not reached the main actor yet.
+        guard followSystemOutput() else { return }
         guard let output = selectedOutput else { errorMessage = "Choose an available headphones, speakers, or DAC output."; return }
+        if outputEQRule == .noEQ {
+            // Arm automatic routing without creating a capture/playback path.
+            processingRequested = true
+            return
+        }
+        if outputEQRule == .global, globalPreset == nil {
+            processingRequested = true
+            return
+        }
+        guard !presetIsBoundElsewhere else {
+            errorMessage = "This preset is bound to another output. Choose a different preset or bind it to \(output.name) before starting."
+            return
+        }
+        processingRequested = true
         do { try router.start(output: output, preset: preset) }
-        catch { errorMessage = error.localizedDescription }
+        catch { processingRequested = false; errorMessage = error.localizedDescription }
+    }
+
+    @discardableResult
+    func selectOutput(_ uid: String) -> Bool {
+        guard let output = outputs.first(where: { $0.uid == uid }) else {
+            errorMessage = "The selected output is no longer available."
+            return false
+        }
+        // An unchanged picker action can arrive during a system-originated
+        // refresh. Never use it to reassert a stale app selection.
+        guard outputUID != uid else { return true }
+        let resume = processingRequested || router.running || router.recovering
+        stopProcessing()
+        do {
+            try CoreAudioDevices.setDefaultOutputDeviceID(output.id)
+            router.acknowledgeSystemOutputChange()
+            processingRequested = resume
+            if outputUID == uid { outputChanged() }
+            else { outputUID = uid }
+            return true
+        } catch {
+            if let actual = outputs.first(where: { $0.id == CoreAudioDevices.defaultOutputDeviceID() }) {
+                outputUID = actual.uid
+            }
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    private func followSystemOutput() -> Bool {
+        devices = CoreAudioDevices.all()
+        guard let actual = outputs.first(where: { $0.id == CoreAudioDevices.defaultOutputDeviceID() }) else {
+            stopProcessing()
+            return false
+        }
+        if outputUID != actual.uid { outputUID = actual.uid }
+        return true
+    }
+
+    func setGlobalPreset(_ item: EQPreset?) {
+        guard item.map({ isGlobal($0) }) ?? true else { return }
+        globalPreset = item
+        if outputEQRule == .global { outputChanged() }
+        saveState()
+    }
+
+    private func stopProcessing() {
+        retryTask?.cancel()
+        retryTask = nil
+        processingRequested = false
+        router.stop()
+    }
+
+    private func outputChanged() {
+        let resume = processingRequested || router.running || router.recovering
+        stopProcessing()
+        if outputEQRule == .noEQ {
+            processingRequested = resume
+            return
+        }
+        let destinationPreset = (outputEQRule == .preset ? devicePresets[outputUID] : nil)
+            ?? globalPreset.flatMap { isGlobal($0) ? $0 : nil }
+        guard let destinationPreset else {
+            // A device-specific preset cannot spill onto another device.
+            // Wait only when there is no global preset to use instead.
+            processingRequested = resume
+            return
+        }
+        if preset != destinationPreset { preset = destinationPreset }
+        processingRequested = resume
+        if resume { scheduleRecovery() }
+    }
+
+    func setPresetBoundToOutput(_ enabled: Bool) {
+        guard selectedOutput != nil else { return }
+        if enabled {
+            outputRules[outputUID] = .preset
+            devicePresets[outputUID] = preset
+        } else if devicePresets[outputUID]?.id == preset.id {
+            devicePresets.removeValue(forKey: outputUID)
+            outputRules.removeValue(forKey: outputUID)
+        }
+        if !enabled, presetIsGlobal { globalPreset = preset }
+        else if globalPreset?.id == preset.id { globalPreset = nil }
+        saveState()
+        if processingRequested, presetIsBoundElsewhere || (!router.running && !router.recovering) { outputChanged() }
+    }
+
+    func setOutputEQRule(_ rule: OutputEQRule) {
+        guard selectedOutput != nil else { return }
+        outputRules[outputUID] = rule
+        if rule == .preset {
+            let bound = devicePresets[outputUID] ?? preset
+            devicePresets[outputUID] = bound
+            if globalPreset?.id == bound.id { globalPreset = nil }
+        }
+        // Keep an existing binding when choosing No EQ or Use global so it
+        // can be restored later. The output rule always takes precedence.
+        outputChanged()
+        saveState()
     }
 
     func addBand() { preset.bands.append(EQBand(frequency: 1000)) }
     func deleteBand(_ id: UUID) { preset.bands.removeAll { $0.id == id } }
     func savePreset(named name: String) {
-        var copy = preset; copy.id = UUID(); copy.name = name.isEmpty ? "Untitled" : name
+        let previousID = preset.id
+        var copy = preset
+        copy.name = name.isEmpty ? "Untitled" : name
+        copy.id = presets.first { $0.name.caseInsensitiveCompare(copy.name) == .orderedSame }?.id ?? UUID()
         presets.removeAll { $0.name.caseInsensitiveCompare(copy.name) == .orderedSame }
+        devicePresets = devicePresets.mapValues { $0.id == copy.id ? copy : $0 }
+        // Save As moves only this device to the new preset; other devices
+        // retain their existing preset associations.
+        if devicePresets[outputUID]?.id == previousID { devicePresets[outputUID] = copy }
+        if outputEQRule == .global, isGlobal(copy) { globalPreset = copy }
         presets.append(copy); preset = copy; persistPresets()
     }
-    func load(_ item: EQPreset) { preset = item }
-    func deletePreset(_ item: EQPreset) { presets.removeAll { $0.id == item.id }; persistPresets() }
+    func load(_ item: EQPreset) {
+        if outputEQRule == .preset {
+            devicePresets[outputUID] = item
+            if globalPreset?.id == item.id { globalPreset = nil }
+        }
+        if outputEQRule != .noEQ, devicePresets[outputUID]?.id != item.id, devicePresets.values.contains(where: { $0.id == item.id }) {
+            stopProcessing()
+        }
+        if outputEQRule == .global, isGlobal(item) { globalPreset = item }
+        preset = item
+        // Selecting a global preset while waiting for a device preset should
+        // resume the session immediately. Explicit Stop still stays stopped.
+        if processingRequested, !router.running, !router.recovering { outputChanged() }
+    }
+    func deletePreset(_ item: EQPreset) {
+        presets.removeAll { $0.id == item.id }
+        devicePresets = devicePresets.filter { $0.value.id != item.id }
+        if globalPreset?.id == item.id { globalPreset = nil }
+        persistPresets(); saveState()
+        if outputEQRule == .global { outputChanged() }
+    }
 
     func importText(_ text: String, name: String = "Imported") throws {
-        preset = try APOParser.parse(text, name: name)
+        load(try APOParser.parse(text, name: name))
     }
     func exportText() -> String { APOParser.serialize(preset) }
 
     private func scheduleRecovery() {
+        guard outputEQRule != .noEQ else { outputChanged(); return }
         retryTask?.cancel()
         router.beginRecovery()
         retryTask = Task { [weak self] in
             for _ in 0..<8 {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, let self else { return }
+                // A Control Center change can precede its Core Audio callback.
+                // Adopt it before restarting, never restart the previous route.
+                self.followSystemOutput()
+                guard !Task.isCancelled else { return }
                 self.refreshDevices()
+                guard self.outputEQRule != .noEQ else { self.outputChanged(); return }
                 guard let o = self.selectedOutput else { continue }
                 do {
                     try self.router.start(output: o, preset: self.preset)
@@ -125,6 +306,7 @@ final class AppModel: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             self?.router.stop()
+            self?.processingRequested = false
             self?.errorMessage = "The audio devices did not reconnect. Check the connections, then press Start."
         }
     }
@@ -133,6 +315,9 @@ final class AppModel: ObservableObject {
         outputUID = defaults.string(forKey: "outputUID") ?? ""
         if let data = defaults.data(forKey: "currentPreset"), let value = try? JSONDecoder().decode(EQPreset.self, from: data) { preset = value }
         if let data = defaults.data(forKey: "presets"), let value = try? JSONDecoder().decode([EQPreset].self, from: data) { presets = value }
+        if let data = defaults.data(forKey: "devicePresets"), let value = try? JSONDecoder().decode([String: EQPreset].self, from: data) { devicePresets = value }
+        if let data = defaults.data(forKey: "outputRules"), let value = try? JSONDecoder().decode([String: OutputEQRule].self, from: data) { outputRules = value }
+        if let data = defaults.data(forKey: "globalPreset"), let value = try? JSONDecoder().decode(EQPreset.self, from: data), isGlobal(value) { globalPreset = value }
     }
     private func saveState() {
         // Loading the output selection must not overwrite the preset before
@@ -140,6 +325,9 @@ final class AppModel: ObservableObject {
         guard !restoringState else { return }
         defaults.set(outputUID, forKey: "outputUID")
         defaults.set(try? JSONEncoder().encode(preset), forKey: "currentPreset")
+        defaults.set(try? JSONEncoder().encode(devicePresets), forKey: "devicePresets")
+        defaults.set(try? JSONEncoder().encode(outputRules), forKey: "outputRules")
+        defaults.set(globalPreset.flatMap { try? JSONEncoder().encode($0) }, forKey: "globalPreset")
     }
     private func persistPresets() { defaults.set(try? JSONEncoder().encode(presets), forKey: "presets") }
 }

@@ -42,7 +42,19 @@ struct AudioDevice: Identifiable, Hashable {
     let name: String
     let inputChannels: Int
     let outputChannels: Int
-    var label: String { "\(name) · \(inputChannels) in / \(outputChannels) out" }
+    var label: String { name }
+}
+
+enum OutputEQRule: String, Codable, CaseIterable {
+    case global, preset, noEQ
+
+    var title: String {
+        switch self {
+        case .global: "Use global"
+        case .preset: "Use preset"
+        case .noEQ: "No EQ"
+        }
+    }
 }
 
 struct MeterState: Equatable {

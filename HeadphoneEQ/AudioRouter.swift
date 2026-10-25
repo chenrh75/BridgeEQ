@@ -65,6 +65,7 @@ final class AudioRouter: ObservableObject {
     var onSystemOutputChanged: ((AudioDeviceID) -> Void)?
 
     init() {
+        lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
         meters.onVisibilityChange = { [weak self] in self?.updateMeteringActivity() }
         configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] notification in
             Task { @MainActor in
@@ -113,13 +114,15 @@ final class AudioRouter: ObservableObject {
         onRecoveryNeeded?()
     }
 
+    func acknowledgeSystemOutputChange() {
+        lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
+    }
+
     private func checkSystemOutputChange() {
         guard let current = CoreAudioDevices.defaultOutputDeviceID(), current != lastDefaultOutputDeviceID else { return }
         lastDefaultOutputDeviceID = current
-        // Follow the user's new destination before rebuilding the tap. Restarting
-        // the saved route here would send audio back to the previous output.
-        // A second switch during recovery must also replace the pending route.
-        guard running || recovering else { return }
+        // Update the device preset even while stopped or waiting for a bound
+        // output. The model decides whether the user has requested processing.
         onSystemOutputChanged?(current)
     }
 
@@ -178,7 +181,6 @@ final class AudioRouter: ObservableObject {
             self.systemTap = tap
             self.eq = eq; self.gainMixer = mixer
             observeOutput(output.id)
-            lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
             running = true; status = "System audio → \(output.name)"
             updateMeteringActivity()
         } catch {
@@ -227,7 +229,6 @@ final class AudioRouter: ObservableObject {
         directPath = path
         self.eq = eq
         observeOutput(output.id)
-        lastDefaultOutputDeviceID = CoreAudioDevices.defaultOutputDeviceID()
         running = true; status = "System audio → \(output.name)"
         updateMeteringActivity()
     }
@@ -354,7 +355,7 @@ final class AudioRouter: ObservableObject {
 
     private func startMeterTimer() {
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateMeters() }
+            DispatchQueue.main.async { [weak self] in self?.updateMeters() }
         }
         timer.tolerance = 1.0 / 120.0
         RunLoop.main.add(timer, forMode: .common)
