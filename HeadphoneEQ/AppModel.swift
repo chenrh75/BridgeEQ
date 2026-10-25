@@ -25,6 +25,23 @@ final class AppModel: ObservableObject {
         restoringState = false
         refreshDevices()
         router.onRecoveryNeeded = { [weak self] in self?.scheduleRecovery() }
+        router.onSystemOutputChanged = { [weak self] id in
+            guard let self else { return }
+            // Refresh before resolving the ID: a newly connected device may
+            // become the system default before it appears in our picker.
+            self.devices = CoreAudioDevices.all()
+            if let output = self.outputs.first(where: { $0.id == id }) {
+                if self.outputUID != output.uid {
+                    self.outputUID = output.uid // Also replaces any pending retry.
+                } else {
+                    self.scheduleRecovery()
+                }
+            } else {
+                // Virtual system destinations still require a fresh capture
+                // tap, while playback keeps the selected physical output.
+                self.scheduleRecovery()
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--smoke-test-route") {
             let routeTestSeconds = ProcessInfo.processInfo.environment["BRIDGEEQ_ROUTE_TEST_SECONDS"]
                 .flatMap(Double.init) ?? 2

@@ -9,8 +9,6 @@ A system audio equalizer for Apple-silicon Macs running macOS 14.2 or later.
 3. Press **Start** and allow **System Audio Recording** when prompted.
 4. Adjust the EQ bands, preamp, and output gain. Press **Stop** to return to ordinary playback.
 
-Audio processing continues when the window is hidden or minimized.
-
 If macOS blocks opening the app, go to **System Settings → Privacy & Security → Open Anyway** after attempting to open it. The app is locally signed and is not Apple-notarized.
 
 If audio capture is unavailable, enable BridgeEQ under **System Settings → Privacy & Security → Screen & System Audio Recording**, then relaunch it.

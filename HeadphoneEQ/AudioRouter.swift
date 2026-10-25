@@ -62,6 +62,7 @@ final class AudioRouter: ObservableObject {
     private var ignoreConfigurationChangesUntil = Date.distantPast
     private var routeGeneration = 0
     var onRecoveryNeeded: (() -> Void)?
+    var onSystemOutputChanged: ((AudioDeviceID) -> Void)?
 
     init() {
         meters.onVisibilityChange = { [weak self] in self?.updateMeteringActivity() }
@@ -115,7 +116,11 @@ final class AudioRouter: ObservableObject {
     private func checkSystemOutputChange() {
         guard let current = CoreAudioDevices.defaultOutputDeviceID(), current != lastDefaultOutputDeviceID else { return }
         lastDefaultOutputDeviceID = current
-        requestRecovery(reason: "System output changed; reconnecting…")
+        // Follow the user's new destination before rebuilding the tap. Restarting
+        // the saved route here would send audio back to the previous output.
+        // A second switch during recovery must also replace the pending route.
+        guard running || recovering else { return }
+        onSystemOutputChanged?(current)
     }
 
     func start(output: AudioDevice, preset: EQPreset) throws {
@@ -271,7 +276,8 @@ final class AudioRouter: ObservableObject {
         }
         outputDeviceID = nil; outputDeviceListener = nil
         inputCapture = nil; outputEngine = nil; player = nil; eq = nil; gainMixer = nil
-        lastDefaultOutputDeviceID = nil
+        // Retain the last system destination while reconnecting so changes
+        // during the retry delay are still recognized as output switches.
         _ = inputLevels.drain(); _ = outputLevels.drain()
         holdUntil = [TimeInterval](repeating: 0, count: 4)
         clipUntil = [TimeInterval](repeating: 0, count: 4)
