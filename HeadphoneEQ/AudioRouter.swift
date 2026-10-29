@@ -162,7 +162,7 @@ final class AudioRouter: ObservableObject {
             try outputEngine.start()
             player.play()
 
-            let tap = try SystemAudioTap()
+            let tap = try SystemAudioTap(output: output)
             if tap.format.sampleRate != processingFormat.sampleRate {
                 // The tap can follow a different default output sample rate.
                 // AVAudioEngine converts from its native rate to the output rate.
@@ -492,8 +492,13 @@ private final class SystemAudioTap {
     private(set) var deviceID = AudioDeviceID(kAudioObjectUnknown)
     private(set) var format: AVAudioFormat!
     private(set) var sourceFormat = AudioStreamBasicDescription()
+    let mixdownGain: Float
 
-    init() throws {
+    init(output: AudioDevice) throws {
+        // Core Audio's stereo mixdown divides by the output's stereo-pair
+        // count (e.g. an eight-channel Studio Display loses 12 dB). Restore
+        // unity before EQ/metering; this is independent of the preset gain.
+        mixdownGain = max(1, Float(output.outputChannels) / 2)
         do {
             var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
@@ -506,6 +511,10 @@ private final class SystemAudioTap {
                 throw AudioDeviceError.invalidRoute("Could not exclude BridgeEQ from system capture. Restart the app and try again.")
             }
             let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [processID])
+            // Keep the mixdown and its channel-count correction scoped to
+            // the device we replay through, including on multi-output Macs.
+            description.deviceUID = output.uid
+            description.stream = 0
             description.name = "BridgeEQ System Audio"
             description.isPrivate = true
             // Unlike unconditional mute, this restores ordinary playback when
@@ -623,6 +632,12 @@ private final class TapInputCapture: @unchecked Sendable {
                     return noErr
                 }
                 memcpy(destination[channel], data, Int(frames) * MemoryLayout<Float>.size)
+            }
+        }
+        if tap.mixdownGain != 1 {
+            var scale = tap.mixdownGain
+            for channel in 0..<2 {
+                vDSP_vsmul(destination[channel], 1, &scale, destination[channel], 1, vDSP_Length(frames))
             }
         }
         levels.measure(buffer)
